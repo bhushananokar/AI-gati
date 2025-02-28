@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, random_split
 from torchvision import transforms, datasets
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, OneCycleLR
 import matplotlib.pyplot as plt
@@ -14,6 +14,9 @@ import time
 from sklearn.metrics import confusion_matrix, classification_report
 import seaborn as sns
 import pandas as pd
+
+# Root directory
+ROOT_DIR = "/mnt/Test/SC202"
 
 # Set random seeds for reproducibility
 def seed_everything(seed=42):
@@ -279,8 +282,8 @@ class AdvancedAugmentation:
             transforms.RandomErasing(p=0.3)
         ])
         
-        # Validation transforms - only resize, center crop and normalize
-        val_transforms = [
+        # Test transforms - only resize, center crop and normalize
+        test_transforms = [
             transforms.Resize((img_size + 32, img_size + 32)),
             transforms.CenterCrop(img_size),
             transforms.ToTensor(),
@@ -288,35 +291,96 @@ class AdvancedAugmentation:
         ]
         
         self.train_transform = transforms.Compose(train_transforms)
-        self.val_transform = transforms.Compose(val_transforms)
+        self.test_transform = transforms.Compose(test_transforms)
 
 
-# Load and preprocess data with advanced augmentation
-def load_data(data_dir, img_size=224, batch_size=32, auto_augment=True, num_workers=4):
+# Modified load_data function to work with train_set and test_set
+def load_data(train_data_path, test_data_path, img_size=224, batch_size=32, 
+             auto_augment=True, num_workers=4, validation_split=0.1):
+    """
+    Load data from train_set and test_set paths and create appropriate data loaders
+    
+    Parameters:
+    -----------
+    train_data_path : str
+        Path to the training dataset directory
+    test_data_path : str
+        Path to the test dataset directory
+    img_size : int
+        Image size for resizing
+    batch_size : int
+        Batch size for data loaders
+    auto_augment : bool
+        Whether to use AutoAugment policy
+    num_workers : int
+        Number of workers for data loading
+    validation_split : float
+        Fraction of training data to use for validation
+        
+    Returns:
+    --------
+    train_loader, val_loader, test_loader, num_classes, class_names
+    """
     augmentation = AdvancedAugmentation(img_size=img_size, auto_augment=auto_augment)
     
-    train_dataset = datasets.ImageFolder(
-        root=f"{data_dir}/train", 
+    # Load training dataset
+    train_dataset_full = datasets.ImageFolder(
+        root=train_data_path,
         transform=augmentation.train_transform
     )
-    val_dataset = datasets.ImageFolder(
-        root=f"{data_dir}/val", 
-        transform=augmentation.val_transform
-    )
-    test_dataset = datasets.ImageFolder(
-        root=f"{data_dir}/test", 
-        transform=augmentation.val_transform
+    
+    # Get class names
+    class_names = train_dataset_full.classes
+    num_classes = len(class_names)
+    
+    # Calculate train and validation sizes
+    train_size = int((1 - validation_split) * len(train_dataset_full))
+    val_size = len(train_dataset_full) - train_size
+    
+    # Use random_split to get indices
+    train_indices, val_indices = random_split(
+        range(len(train_dataset_full)),
+        [train_size, val_size],
+        generator=torch.Generator().manual_seed(42)
     )
     
+    # Create datasets
+    train_dataset = torch.utils.data.Subset(
+        datasets.ImageFolder(
+            root=train_data_path,
+            transform=augmentation.train_transform
+        ),
+        train_indices.indices
+    )
+    
+    val_dataset = torch.utils.data.Subset(
+        datasets.ImageFolder(
+            root=train_data_path,
+            transform=augmentation.test_transform
+        ),
+        val_indices.indices
+    )
+    
+    # Load test dataset
+    test_dataset = datasets.ImageFolder(
+        root=test_data_path,
+        transform=augmentation.test_transform
+    )
+    
+    # Get targets for the training subset
+    train_targets = [train_dataset_full.targets[i] for i in train_indices.indices]
+    
     # Create weighted sampler for imbalanced dataset
-    class_weights = compute_class_weights(train_dataset.targets)
-    samples_weights = class_weights[train_dataset.targets]
+    class_weights = compute_class_weights(train_targets)
+    samples_weights = torch.tensor([class_weights[t] for t in train_targets])
+    
     sampler = torch.utils.data.WeightedRandomSampler(
         weights=samples_weights,
         num_samples=len(samples_weights),
         replacement=True
     )
     
+    # Create data loaders
     train_loader = DataLoader(
         train_dataset, 
         batch_size=batch_size, 
@@ -341,11 +405,8 @@ def load_data(data_dir, img_size=224, batch_size=32, auto_augment=True, num_work
         pin_memory=True
     )
     
-    num_classes = len(train_dataset.classes)
-    class_names = train_dataset.classes
-    
     # Save class names for future reference
-    with open(os.path.join(data_dir, 'classes.json'), 'w') as f:
+    with open(os.path.join(ROOT_DIR, 'classes.json'), 'w') as f:
         class_map = {i: name for i, name in enumerate(class_names)}
         json.dump(class_map, f, indent=2)
     
@@ -383,8 +444,10 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
 # Training function with mixup and AMP
 def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, 
                 num_epochs=30, device='cuda', mixup_alpha=0.2, use_amp=True, 
-                patience=5, model_dir='models'):
+                patience=5, model_dir=None):
     # Create model directory if it doesn't exist
+    if model_dir is None:
+        model_dir = os.path.join(ROOT_DIR, 'models')
     os.makedirs(model_dir, exist_ok=True)
     
     model = model.to(device)
@@ -579,7 +642,10 @@ def plot_training_history(history, save_dir):
 
 
 # Evaluate function with confusion matrix
-def evaluate_model(model, test_loader, class_names, device='cuda', save_dir='models'):
+def evaluate_model(model, test_loader, class_names, device='cuda', save_dir=None):
+    if save_dir is None:
+        save_dir = os.path.join(ROOT_DIR, 'models')
+    
     model.eval()
     all_preds = []
     all_labels = []
@@ -642,9 +708,11 @@ def main(config):
         device = torch.device('cpu')
         print("Using CPU")
     
-    # Set directories
-    data_dir = config['data_dir']
-    model_dir = config['model_dir']
+    # Set directories - make sure they are relative to ROOT_DIR
+    train_data_path = os.path.join(ROOT_DIR, config['train_data_path'])
+    test_data_path = os.path.join(ROOT_DIR, config['test_data_path'])
+    model_dir = os.path.join(ROOT_DIR, config['model_dir'])
+    
     os.makedirs(model_dir, exist_ok=True)
     
     # Save configuration
@@ -653,11 +721,13 @@ def main(config):
     
     # Load data with advanced augmentation
     train_loader, val_loader, test_loader, num_classes, class_names = load_data(
-        data_dir=data_dir,
+        train_data_path=train_data_path,
+        test_data_path=test_data_path,
         img_size=config['img_size'],
         batch_size=config['batch_size'],
         auto_augment=config['auto_augment'],
-        num_workers=config['num_workers']
+        num_workers=config['num_workers'],
+        validation_split=config['validation_split']
     )
     
     print(f"Number of classes: {num_classes}")
@@ -751,32 +821,34 @@ def main(config):
 
 
 if __name__ == "__main__":
-    # Configuration dictionary - modify these values directly
+    # Configuration dictionary - modified for train_set and test_set structure
     config = {
         # Data configuration
-        'data_dir': 'processed',           # Path to data with train/val/test splits
-        'model_dir': 'improved_model',     # Directory to save models and results
+        'train_data_path': 'train_set',       # Path to training data set
+        'test_data_path': 'test_set',         # Path to test data set
+        'model_dir': 'vitcnn_model',          # Directory to save models and results
+        'validation_split': 0.1,              # Fraction of training data to use for validation
         
         # Model parameters
         'img_size': 224,                   # Input image size
         'patch_size': 16,                  # Patch size for ViT
-        'embed_dim': 768,                  # Embedding dimension (increased from 512)
-        'depth': 8,                        # Number of transformer blocks (increased from 6)
-        'num_heads': 12,                   # Number of attention heads (increased from 8)
-        'dropout': 0.2,                    # Dropout rate (increased from 0.1)
-        'attn_dropout': 0.1,               # Attention dropout rate (new parameter)
-        'cnn_dropout': 0.1,                # CNN feature extractor dropout (new parameter)
+        'embed_dim': 768,                  # Embedding dimension
+        'depth': 8,                        # Number of transformer blocks
+        'num_heads': 12,                   # Number of attention heads
+        'dropout': 0.2,                    # Dropout rate
+        'attn_dropout': 0.1,               # Attention dropout rate
+        'cnn_dropout': 0.1,                # CNN feature extractor dropout
         
         # Training parameters
         'batch_size': 32,                  # Batch size
-        'epochs': 100,                      # Maximum number of epochs (increased from 20)
-        'lr': 1e-4,                        # Learning rate (decreased from 3e-4)
+        'epochs': 100,                     # Maximum number of epochs
+        'lr': 1e-4,                        # Learning rate
         'weight_decay': 0.05,              # Weight decay for regularization
-        'label_smoothing': 0.1,            # Label smoothing factor (new parameter)
-        'mixup_alpha': 0.2,                # Mixup alpha parameter (new parameter)
-        'auto_augment': True,              # Use AutoAugment policy (new parameter)
+        'label_smoothing': 0.1,            # Label smoothing factor
+        'mixup_alpha': 0.2,                # Mixup alpha parameter
+        'auto_augment': True,              # Use AutoAugment policy
         'scheduler': 'cosine',             # Learning rate scheduler ('cosine' or 'onecycle')
-        'patience': 10,                    # Early stopping patience (new parameter)
+        'patience': 10,                    # Early stopping patience
         
         # Performance options
         'use_cuda': True,                  # Use GPU if available
@@ -793,4 +865,4 @@ if __name__ == "__main__":
     results = main(config)
     
     print(f"Training completed. Final test accuracy: {results['test_acc']:.4f}")
-    print(f"Model and results saved to {config['model_dir']}")
+    print(f"Model and results saved to {os.path.join(ROOT_DIR, config['model_dir'])}")
