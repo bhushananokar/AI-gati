@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, Dataset, random_split
-from torchvision import transforms, datasets
+from torchvision import transforms, datasets, models
 from torch.optim.lr_scheduler import CosineAnnealingWarmRestarts, OneCycleLR
 import matplotlib.pyplot as plt
 import numpy as np
@@ -11,11 +11,12 @@ import os
 import json
 import random
 import time
+import shutil
 from sklearn.metrics import confusion_matrix, classification_report
 import seaborn as sns
 import pandas as pd
 
-# Root directory
+# Root directory - fixed path as specified
 ROOT_DIR = "/mnt/Test/SC202"
 
 # Set random seeds for reproducibility
@@ -30,33 +31,63 @@ def seed_everything(seed=42):
 
 seed_everything()
 
-class PatchEmbedding(nn.Module):
+class EnhancedCNNBackbone(nn.Module):
     """
-    Split image into patches and embed them.
+    Enhanced CNN Backbone using a pre-trained ResNet50 model
     """
-    def __init__(self, img_size=224, patch_size=16, in_channels=3, embed_dim=768):
+    def __init__(self, pretrained=True):
         super().__init__()
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.n_patches = (img_size // patch_size) ** 2
+        # Load a pre-trained ResNet50 model
+        resnet = models.resnet50(weights='IMAGENET1K_V2' if pretrained else None)
         
+        # Use layers up to the fourth block
+        self.features = nn.Sequential(
+            resnet.conv1,
+            resnet.bn1,
+            resnet.relu,
+            resnet.maxpool,
+            resnet.layer1,  # Resolution: 56x56, Channels: 256
+            resnet.layer2,  # Resolution: 28x28, Channels: 512
+            resnet.layer3,  # Resolution: 14x14, Channels: 1024
+            resnet.layer4   # Resolution: 7x7, Channels: 2048
+        )
+        
+        # Freeze early layers to preserve learned features
+        for param in self.features[:6].parameters():
+            param.requires_grad = False
+    
+    def forward(self, x):
+        return self.features(x)
+
+class ImprovedPatchEmbedding(nn.Module):
+    """
+    Improved patch embedding with layer normalization
+    """
+    def __init__(self, in_channels=2048, patch_size=1, embed_dim=768):
+        super().__init__()
         self.proj = nn.Conv2d(
             in_channels,
             embed_dim,
             kernel_size=patch_size,
             stride=patch_size
         )
-
+        self.norm = nn.LayerNorm(embed_dim)
+        
     def forward(self, x):
         """
         x: [B, C, H, W]
         """
+        B, C, H, W = x.shape
         x = self.proj(x)  # [B, E, H/P, W/P]
         x = x.flatten(2)  # [B, E, H*W/P^2]
         x = x.transpose(1, 2)  # [B, H*W/P^2, E]
+        x = self.norm(x)
         return x
 
 class MultiHeadSelfAttention(nn.Module):
+    """
+    Multi-head self-attention with improved implementation
+    """
     def __init__(self, embed_dim=768, num_heads=12, dropout=0.1):
         super().__init__()
         self.embed_dim = embed_dim
@@ -64,6 +95,7 @@ class MultiHeadSelfAttention(nn.Module):
         self.head_dim = embed_dim // num_heads
         assert self.head_dim * num_heads == embed_dim, "embed_dim must be divisible by num_heads"
         
+        # Use a single projection for efficiency
         self.qkv = nn.Linear(embed_dim, embed_dim * 3)
         self.attn_drop = nn.Dropout(dropout)
         self.proj = nn.Linear(embed_dim, embed_dim)
@@ -74,123 +106,100 @@ class MultiHeadSelfAttention(nn.Module):
         x: [B, N, E]
         """
         B, N, E = x.shape
+        
+        # Calculate QKV projections in one go for efficiency
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         q, k, v = qkv[0], qkv[1], qkv[2]  # [B, H, N, D]
         
+        # Scaled dot-product attention
         attn = (q @ k.transpose(-2, -1)) * (self.head_dim ** -0.5)  # [B, H, N, N]
         attn = attn.softmax(dim=-1)
         attn = self.attn_drop(attn)
         
+        # Apply attention to values and reshape
         x = (attn @ v).transpose(1, 2).reshape(B, N, E)  # [B, N, E]
         x = self.proj(x)
         x = self.proj_drop(x)
         return x
 
-class MLP(nn.Module):
-    def __init__(self, in_features, hidden_features=None, out_features=None, dropout=0.1, act_layer=nn.GELU):
+class FeedForward(nn.Module):
+    """
+    Improved MLP block with GELU activation and layer norm
+    """
+    def __init__(self, dim, hidden_dim, dropout=0.1):
         super().__init__()
-        out_features = out_features or in_features
-        hidden_features = hidden_features or in_features * 4
-        
-        self.fc1 = nn.Linear(in_features, hidden_features)
-        self.act = act_layer()
-        self.fc2 = nn.Linear(hidden_features, out_features)
-        self.drop = nn.Dropout(dropout)
+        self.net = nn.Sequential(
+            nn.Linear(dim, hidden_dim),
+            nn.GELU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden_dim, dim),
+            nn.Dropout(dropout)
+        )
         
     def forward(self, x):
-        x = self.fc1(x)
-        x = self.act(x)
-        x = self.drop(x)
-        x = self.fc2(x)
-        x = self.drop(x)
-        return x
+        return self.net(x)
 
 class TransformerBlock(nn.Module):
+    """
+    Enhanced transformer block with pre-norm architecture
+    """
     def __init__(self, embed_dim, num_heads, mlp_ratio=4, dropout=0.1, attn_dropout=0.1):
         super().__init__()
         self.norm1 = nn.LayerNorm(embed_dim)
         self.attn = MultiHeadSelfAttention(embed_dim, num_heads, attn_dropout)
         self.norm2 = nn.LayerNorm(embed_dim)
-        self.mlp = MLP(embed_dim, hidden_features=int(embed_dim * mlp_ratio), dropout=dropout)
+        self.mlp = FeedForward(
+            dim=embed_dim,
+            hidden_dim=int(embed_dim * mlp_ratio),
+            dropout=dropout
+        )
         
     def forward(self, x):
+        # Pre-norm architecture (better training stability)
         x = x + self.attn(self.norm1(x))
         x = x + self.mlp(self.norm2(x))
         return x
 
-class CNNBlock(nn.Module):
-    def __init__(self, in_channels, out_channels, kernel_size=3, stride=1, padding=1, dropout=0.0):
-        super().__init__()
-        self.conv = nn.Conv2d(in_channels, out_channels, kernel_size, stride, padding)
-        self.bn = nn.BatchNorm2d(out_channels)
-        self.relu = nn.ReLU(inplace=True)
-        self.pool = nn.MaxPool2d(2, 2)
-        self.dropout = nn.Dropout2d(dropout) if dropout > 0 else nn.Identity()
-        
-    def forward(self, x):
-        x = self.conv(x)
-        x = self.bn(x)
-        x = self.relu(x)
-        x = self.pool(x)
-        x = self.dropout(x)
-        return x
-
-class CNNBackbone(nn.Module):
-    def __init__(self, in_channels=3, dropout=0.1):
-        super().__init__()
-        self.features = nn.Sequential(
-            CNNBlock(in_channels, 64, dropout=dropout),  # 224 -> 112
-            CNNBlock(64, 128, dropout=dropout),          # 112 -> 56
-            CNNBlock(128, 256, dropout=dropout),         # 56 -> 28
-            CNNBlock(256, 512, dropout=dropout),         # 28 -> 14
-        )
-        
-    def forward(self, x):
-        return self.features(x)
-
-class ViTCNNHybrid(nn.Module):
-    def __init__(self, img_size=224, patch_size=16, in_channels=3, 
-                 num_classes=1000, embed_dim=768, depth=12, 
-                 num_heads=12, mlp_ratio=4, dropout=0.1, attn_dropout=0.0,
-                 cnn_dropout=0.1):
+class ImprovedViTCNNHybrid(nn.Module):
+    """
+    Improved ViT-CNN Hybrid with pre-trained CNN backbone
+    """
+    def __init__(self, img_size=224, patch_size=1, in_channels=3, 
+                 num_classes=8, embed_dim=768, depth=12, 
+                 num_heads=12, mlp_ratio=4, dropout=0.1, attn_dropout=0.1,
+                 cnn_pretrained=True):
         super().__init__()
         
-        # CNN Feature Extractor - deeper network
-        self.cnn_features = CNNBackbone(in_channels, dropout=cnn_dropout)
+        # Enhanced CNN Feature Extractor - pre-trained
+        self.cnn_features = EnhancedCNNBackbone(pretrained=cnn_pretrained)
+        self.cnn_output_size = img_size // 32  # ResNet50 downsamples by factor of 32
         
-        # Calculate new image size after CNN feature extraction (4 max pools of 2x2)
-        self.cnn_output_size = img_size // 16
-        
-        # Patch Embedding
-        self.patch_embed = PatchEmbedding(
-            img_size=self.cnn_output_size,
-            patch_size=patch_size // 16,  # Adjust patch size based on CNN downsampling
-            in_channels=512,  # Output channels from last CNN layer
+        # Improved Patch Embedding
+        self.patch_embed = ImprovedPatchEmbedding(
+            in_channels=2048,  # ResNet50 output channels
+            patch_size=patch_size,
             embed_dim=embed_dim
         )
         
         # Class token and position embedding
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.patch_embed.n_patches + 1, embed_dim))
-        
-        # Dropout after position embedding
+        num_patches = (self.cnn_output_size // patch_size) ** 2
+        self.pos_embed = nn.Parameter(torch.zeros(1, num_patches + 1, embed_dim))
         self.pos_drop = nn.Dropout(dropout)
         
-        # Transformer Encoder
+        # Transformer Encoder with better initialization
         self.blocks = nn.ModuleList([
             TransformerBlock(embed_dim, num_heads, mlp_ratio, dropout, attn_dropout)
             for _ in range(depth)
         ])
         
-        # Layer Norm and MLP Head
+        # Improved classifier head
         self.norm = nn.LayerNorm(embed_dim)
-        
-        # Improved classifier head with dropout
         self.head = nn.Sequential(
             nn.Linear(embed_dim, embed_dim // 2),
             nn.LayerNorm(embed_dim // 2),
             nn.GELU(),
-            nn.Dropout(dropout),
+            nn.Dropout(0.2),
             nn.Linear(embed_dim // 2, num_classes)
         )
         
@@ -211,21 +220,17 @@ class ViTCNNHybrid(nn.Module):
         elif isinstance(m, nn.LayerNorm):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
-        elif isinstance(m, nn.Conv2d):
-            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
     
     def forward_features(self, x):
         # CNN Feature Extraction
-        x = self.cnn_features(x)  # [B, C', H', W']
+        x = self.cnn_features(x)  # [B, 2048, H/32, W/32]
         
         # Patch Embedding
-        x = self.patch_embed(x)  # [B, N, E]
+        x = self.patch_embed(x)  # [B, (H/32)*(W/32), E]
         
         # Add class token
         cls_tokens = self.cls_token.expand(x.shape[0], -1, -1)
-        x = torch.cat((cls_tokens, x), dim=1)  # [B, N+1, E]
+        x = torch.cat((cls_tokens, x), dim=1)  # [B, 1+(H/32)*(W/32), E]
         
         # Add position embedding and dropout
         x = x + self.pos_embed
@@ -246,87 +251,77 @@ class ViTCNNHybrid(nn.Module):
         return x
 
 
-# Advanced augmentation for medical images
-class AdvancedAugmentation:
-    def __init__(self, img_size=224, color_jitter=0.3, auto_augment=True):
-        # Training transforms with advanced augmentation
-        train_transforms = []
+# Enhanced configuration optimized for skin disease classification
+def get_optimal_config():
+    # Define model directory within ROOT_DIR
+    model_dir = os.path.join(ROOT_DIR, 'improved_vitcnn_model')
+    
+    # Create directory if it doesn't exist
+    os.makedirs(model_dir, exist_ok=True)
+    
+    return {
+        # Data configuration
+        'train_data_path': "/mnt/Test/SC202/SkinDisease/SkinDisease/train",
+        'test_data_path': "/mnt/Test/SC202/SkinDisease/SkinDisease/test",
+        'model_dir': model_dir,
+        'validation_split': 0.15,  # Increased validation split for better evaluation
         
-        # Start with resize and center crop
-        train_transforms.extend([
-            transforms.Resize((img_size + 32, img_size + 32)),
-            transforms.RandomCrop(img_size),
-        ])
+        # Model parameters - optimized for skin disease classification
+        'img_size': 224,
+        'patch_size': 1,  # Use 1x1 patches for fine-grained features
+        'embed_dim': 512,  # Reduced embedding dimension for better generalization
+        'depth': 6,       # Shallower transformer (sufficient for this task)
+        'num_heads': 8,   # Fewer attention heads
+        'dropout': 0.2,   # Increased dropout for better regularization
+        'attn_dropout': 0.1,
+        'cnn_pretrained': True,  # Use pre-trained backbone
         
-        # Add various augmentations
-        train_transforms.extend([
-            transforms.RandomHorizontalFlip(),
-            transforms.RandomVerticalFlip(),
-            transforms.RandomRotation(20),
-            transforms.ColorJitter(
-                brightness=color_jitter,
-                contrast=color_jitter,
-                saturation=color_jitter,
-                hue=color_jitter/2
-            ),
-        ])
+        # Training parameters - optimal for skin dataset
+        'batch_size': 8,   # Smaller batch size to prevent OOM errors
+        'epochs': 50,      # More epochs for thorough training
+        'lr': 5e-5,        # Lower learning rate for stable training
+        'weight_decay': 0.01,
+        'label_smoothing': 0.1,
+        'mixup_alpha': 0.4,  # Stronger mixup for better generalization
+        'auto_augment': True,
+        'scheduler': 'cosine',
+        'patience': 15,    # More patience to avoid early stopping
         
-        # Use AutoAugment policy if selected
-        if auto_augment:
-            train_transforms.append(transforms.AutoAugment(transforms.AutoAugmentPolicy.IMAGENET))
-        
-        # Finalize transforms
-        train_transforms.extend([
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-            transforms.RandomErasing(p=0.3)
-        ])
-        
-        # Test transforms - only resize, center crop and normalize
-        test_transforms = [
-            transforms.Resize((img_size + 32, img_size + 32)),
-            transforms.CenterCrop(img_size),
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ]
-        
-        self.train_transform = transforms.Compose(train_transforms)
-        self.test_transform = transforms.Compose(test_transforms)
+        # Performance options
+        'use_cuda': True,
+        'use_amp': True,
+        'num_workers': 2   # Reduced workers to prevent memory issues
+    }
 
 
-# Modified load_data function to work with train_set and test_set
-def load_data(train_data_path, test_data_path, img_size=224, batch_size=32, 
-             auto_augment=True, num_workers=4, validation_split=0.1):
+# Modified loading function to handle memory constraints
+def load_data_memory_efficient(train_data_path, test_data_path, img_size=224, batch_size=8, 
+                  auto_augment=True, num_workers=2, validation_split=0.15):
     """
-    Load data from train_set and test_set paths and create appropriate data loaders
-    
-    Parameters:
-    -----------
-    train_data_path : str
-        Path to the training dataset directory
-    test_data_path : str
-        Path to the test dataset directory
-    img_size : int
-        Image size for resizing
-    batch_size : int
-        Batch size for data loaders
-    auto_augment : bool
-        Whether to use AutoAugment policy
-    num_workers : int
-        Number of workers for data loading
-    validation_split : float
-        Fraction of training data to use for validation
-        
-    Returns:
-    --------
-    train_loader, val_loader, test_loader, num_classes, class_names
+    Memory efficient data loading function
     """
-    augmentation = AdvancedAugmentation(img_size=img_size, auto_augment=auto_augment)
+    # Advanced augmentation with memory efficiency in mind
+    train_transforms = transforms.Compose([
+        transforms.Resize((img_size, img_size)),  # Direct resize instead of larger crop
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomVerticalFlip(),
+        transforms.RandomRotation(20),
+        transforms.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
+        transforms.RandomErasing(p=0.3)
+    ])
     
-    # Load training dataset
+    test_transforms = transforms.Compose([
+        transforms.Resize((img_size, img_size)),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
+    # Load datasets
     train_dataset_full = datasets.ImageFolder(
         root=train_data_path,
-        transform=augmentation.train_transform
+        transform=train_transforms
     )
     
     # Get class names
@@ -348,7 +343,7 @@ def load_data(train_data_path, test_data_path, img_size=224, batch_size=32,
     train_dataset = torch.utils.data.Subset(
         datasets.ImageFolder(
             root=train_data_path,
-            transform=augmentation.train_transform
+            transform=train_transforms
         ),
         train_indices.indices
     )
@@ -356,7 +351,7 @@ def load_data(train_data_path, test_data_path, img_size=224, batch_size=32,
     val_dataset = torch.utils.data.Subset(
         datasets.ImageFolder(
             root=train_data_path,
-            transform=augmentation.test_transform
+            transform=test_transforms
         ),
         val_indices.indices
     )
@@ -364,29 +359,17 @@ def load_data(train_data_path, test_data_path, img_size=224, batch_size=32,
     # Load test dataset
     test_dataset = datasets.ImageFolder(
         root=test_data_path,
-        transform=augmentation.test_transform
+        transform=test_transforms
     )
     
-    # Get targets for the training subset
-    train_targets = [train_dataset_full.targets[i] for i in train_indices.indices]
-    
-    # Create weighted sampler for imbalanced dataset
-    class_weights = compute_class_weights(train_targets)
-    samples_weights = torch.tensor([class_weights[t] for t in train_targets])
-    
-    sampler = torch.utils.data.WeightedRandomSampler(
-        weights=samples_weights,
-        num_samples=len(samples_weights),
-        replacement=True
-    )
-    
-    # Create data loaders
+    # Create memory-efficient data loaders
     train_loader = DataLoader(
         train_dataset, 
         batch_size=batch_size, 
-        sampler=sampler,
+        shuffle=True,  # Use shuffle instead of sampler to save memory
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=False,  # Disable pin_memory to save memory
+        drop_last=True     # Drop last incomplete batch
     )
     
     val_loader = DataLoader(
@@ -394,7 +377,7 @@ def load_data(train_data_path, test_data_path, img_size=224, batch_size=32,
         batch_size=batch_size, 
         shuffle=False, 
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=False
     )
     
     test_loader = DataLoader(
@@ -402,26 +385,13 @@ def load_data(train_data_path, test_data_path, img_size=224, batch_size=32,
         batch_size=batch_size, 
         shuffle=False, 
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=False
     )
-    
-    # Save class names for future reference
-    with open(os.path.join(ROOT_DIR, 'classes.json'), 'w') as f:
-        class_map = {i: name for i, name in enumerate(class_names)}
-        json.dump(class_map, f, indent=2)
     
     return train_loader, val_loader, test_loader, num_classes, class_names
 
 
-# Compute class weights for imbalanced datasets
-def compute_class_weights(targets):
-    class_counts = torch.bincount(torch.tensor(targets))
-    total_samples = len(targets)
-    class_weights = total_samples / (len(class_counts) * class_counts.float())
-    return class_weights
-
-
-# Mixup augmentation
+# Mixup augmentation function
 def mixup_data(x, y, alpha=0.2):
     '''Returns mixed inputs, pairs of targets, and lambda'''
     if alpha > 0:
@@ -441,14 +411,15 @@ def mixup_criterion(criterion, pred, y_a, y_b, lam):
     return lam * criterion(pred, y_a) + (1 - lam) * criterion(pred, y_b)
 
 
-# Training function with mixup and AMP
-def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler, 
-                num_epochs=30, device='cuda', mixup_alpha=0.2, use_amp=True, 
-                patience=5, model_dir=None):
-    # Create model directory if it doesn't exist
+# Memory-efficient training loop
+def train_model_efficient(model, train_loader, val_loader, criterion, optimizer, scheduler, 
+                          num_epochs=30, device='cuda', mixup_alpha=0.2, use_amp=True,
+                          patience=15, model_dir=None):
     if model_dir is None:
         model_dir = os.path.join(ROOT_DIR, 'models')
     os.makedirs(model_dir, exist_ok=True)
+    
+    print(f"Models will be saved to: {model_dir}")
     
     model = model.to(device)
     scaler = torch.cuda.amp.GradScaler() if use_amp else None
@@ -464,7 +435,8 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         'train_loss': [], 
         'train_acc': [], 
         'val_loss': [], 
-        'val_acc': []
+        'val_acc': [],
+        'lr': []  # Track learning rate changes
     }
     
     start_time = time.time()
@@ -476,59 +448,97 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         running_corrects = 0
         total_samples = 0
         
-        for inputs, labels in tqdm(train_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Train]"):
-            inputs = inputs.to(device)
-            labels = labels.to(device)
-            batch_size = inputs.size(0)
-            total_samples += batch_size
-            
-            # Apply mixup
-            if mixup_alpha > 0:
-                inputs, labels_a, labels_b, lam = mixup_data(inputs, labels, mixup_alpha)
+        # Use tqdm for progress tracking
+        train_progress = tqdm(enumerate(train_loader), total=len(train_loader), 
+                            desc=f"Epoch {epoch+1}/{num_epochs} [Train]")
+        
+        # Process batches
+        for i, (inputs, labels) in train_progress:
+            try:
+                inputs = inputs.to(device)
+                labels = labels.to(device)
+                batch_size = inputs.size(0)
+                total_samples += batch_size
                 
-            optimizer.zero_grad()
-            
-            # Use AMP for faster training
-            if use_amp:
-                with torch.cuda.amp.autocast():
-                    outputs = model(inputs)
-                    if mixup_alpha > 0:
-                        loss = mixup_criterion(criterion, outputs, labels_a, labels_b, lam)
-                    else:
-                        loss = criterion(outputs, labels)
-                
-                scaler.scale(loss).backward()
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                outputs = model(inputs)
+                # Apply mixup
                 if mixup_alpha > 0:
-                    loss = mixup_criterion(criterion, outputs, labels_a, labels_b, lam)
+                    # Mixup implementation
+                    mixed_inputs, labels_a, labels_b, lam = mixup_data(inputs, labels, mixup_alpha)
+                    
+                    optimizer.zero_grad()
+                    
+                    # Use AMP for faster training
+                    if use_amp:
+                        with torch.cuda.amp.autocast():
+                            outputs = model(mixed_inputs)
+                            loss = mixup_criterion(criterion, outputs, labels_a, labels_b, lam)
+                        
+                        scaler.scale(loss).backward()
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        outputs = model(mixed_inputs)
+                        loss = mixup_criterion(criterion, outputs, labels_a, labels_b, lam)
+                        loss.backward()
+                        optimizer.step()
+                    
+                    # Calculate accuracy for mixup (approximation)
+                    _, preds = torch.max(outputs, 1)
+                    running_corrects += (lam * torch.sum(preds == labels_a) + 
+                                       (1 - lam) * torch.sum(preds == labels_b)).item()
                 else:
-                    loss = criterion(outputs, labels)
+                    optimizer.zero_grad()
+                    
+                    if use_amp:
+                        with torch.cuda.amp.autocast():
+                            outputs = model(inputs)
+                            loss = criterion(outputs, labels)
+                        
+                        scaler.scale(loss).backward()
+                        scaler.step(optimizer)
+                        scaler.update()
+                    else:
+                        outputs = model(inputs)
+                        loss = criterion(outputs, labels)
+                        loss.backward()
+                        optimizer.step()
+                    
+                    # Calculate accuracy 
+                    _, preds = torch.max(outputs, 1)
+                    running_corrects += torch.sum(preds == labels).item()
                 
-                loss.backward()
-                optimizer.step()
+                running_loss += loss.item() * batch_size
+                
+                # Update progress
+                train_progress.set_postfix({
+                    'loss': f"{loss.item():.4f}"
+                })
+                
+                # Release memory
+                del inputs, outputs
+                if mixup_alpha > 0:
+                    del mixed_inputs, labels_a, labels_b
+                torch.cuda.empty_cache()
             
-            running_loss += loss.item() * batch_size
-            
-            # If using mixup, we can't count corrects directly
-            if mixup_alpha > 0:
-                # For simplicity, use the primary labels for accuracy
-                _, preds = torch.max(outputs, 1)
-                running_corrects += torch.sum(preds == labels_a.data)
-            else:
-                _, preds = torch.max(outputs, 1)
-                running_corrects += torch.sum(preds == labels.data)
+            except RuntimeError as e:
+                if 'out of memory' in str(e):
+                    print(f"WARNING: GPU out of memory in batch {i}, skipping...")
+                    # Clear cache and skip this batch
+                    torch.cuda.empty_cache()
+                    continue
+                else:
+                    raise e
         
         if scheduler is not None:
             scheduler.step()
+            current_lr = scheduler.get_last_lr()[0]
+            history['lr'].append(current_lr)
             
         epoch_loss = running_loss / total_samples
-        epoch_acc = running_corrects.double() / total_samples
+        epoch_acc = running_corrects / total_samples
         
         history['train_loss'].append(epoch_loss)
-        history['train_acc'].append(epoch_acc.item())
+        history['train_acc'].append(epoch_acc)
         
         print(f'Train Loss: {epoch_loss:.4f} Acc: {epoch_acc:.4f}')
         
@@ -538,30 +548,52 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         val_running_corrects = 0
         val_total_samples = 0
         
-        for inputs, labels in tqdm(val_loader, desc=f"Epoch {epoch+1}/{num_epochs} [Val]"):
-            inputs = inputs.to(device)
-            labels = labels.to(device)
-            batch_size = inputs.size(0)
-            val_total_samples += batch_size
-            
-            with torch.no_grad():
-                if use_amp:
-                    with torch.cuda.amp.autocast():
+        val_progress = tqdm(enumerate(val_loader), total=len(val_loader), 
+                          desc=f"Epoch {epoch+1}/{num_epochs} [Val]")
+        
+        for i, (inputs, labels) in val_progress:
+            try:
+                inputs = inputs.to(device)
+                labels = labels.to(device)
+                batch_size = inputs.size(0)
+                val_total_samples += batch_size
+                
+                with torch.no_grad():
+                    if use_amp:
+                        with torch.cuda.amp.autocast():
+                            outputs = model(inputs)
+                            loss = criterion(outputs, labels)
+                    else:
                         outputs = model(inputs)
                         loss = criterion(outputs, labels)
-                else:
-                    outputs = model(inputs)
-                    loss = criterion(outputs, labels)
+                
+                val_running_loss += loss.item() * batch_size
+                _, preds = torch.max(outputs, 1)
+                val_running_corrects += torch.sum(preds == labels).item()
+                
+                # Update progress
+                val_progress.set_postfix({
+                    'loss': f"{loss.item():.4f}"
+                })
+                
+                # Release memory
+                del inputs, outputs
+                torch.cuda.empty_cache()
             
-            val_running_loss += loss.item() * batch_size
-            _, preds = torch.max(outputs, 1)
-            val_running_corrects += torch.sum(preds == labels.data)
+            except RuntimeError as e:
+                if 'out of memory' in str(e):
+                    print(f"WARNING: GPU out of memory in validation batch {i}, skipping...")
+                    # Clear cache and skip this batch
+                    torch.cuda.empty_cache()
+                    continue
+                else:
+                    raise e
         
         val_epoch_loss = val_running_loss / val_total_samples
-        val_epoch_acc = val_running_corrects.double() / val_total_samples
+        val_epoch_acc = val_running_corrects / val_total_samples
         
         history['val_loss'].append(val_epoch_loss)
-        history['val_acc'].append(val_epoch_acc.item())
+        history['val_acc'].append(val_epoch_acc)
         
         print(f'Val Loss: {val_epoch_loss:.4f} Acc: {val_epoch_acc:.4f}')
         
@@ -576,15 +608,13 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
             
             # Save model info
             model_info = {
-                'img_size': 224,
-                'patch_size': 16,
-                'num_classes': model.head[-1].out_features,
-                'embed_dim': model.blocks[0].norm1.normalized_shape[0],
-                'depth': len(model.blocks),
-                'num_heads': model.blocks[0].attn.num_heads,
-                'dropout': model.pos_drop.p,
                 'epoch': epoch + 1,
-                'best_val_acc': best_val_acc.item(),
+                'val_acc': val_epoch_acc,
+                'val_loss': val_epoch_loss,
+                'train_acc': epoch_acc,
+                'train_loss': epoch_loss,
+                'best_val_acc': best_val_acc,
+                'img_size': 224,
                 'training_time': time.time() - start_time
             }
             
@@ -600,13 +630,17 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
         
         # Also save the most recent model
         torch.save(model.state_dict(), os.path.join(model_dir, 'last_model.pth'))
+        
+        # Plot and save training history after each epoch
+        if (epoch + 1) % 5 == 0 or epoch == num_epochs - 1:
+            plot_training_history(history, model_dir)
+        
+        # Clear memory at the end of each epoch
+        torch.cuda.empty_cache()
     
     total_time = time.time() - start_time
     print(f'Training completed in {total_time//60:.0f}m {total_time%60:.0f}s')
     print(f'Best val accuracy: {best_val_acc:.4f} at epoch {best_epoch+1}')
-    
-    # Plot training history
-    plot_training_history(history, model_dir)
     
     # Load the best model for final evaluation
     model.load_state_dict(torch.load(os.path.join(model_dir, 'best_model.pth')))
@@ -616,10 +650,10 @@ def train_model(model, train_loader, val_loader, criterion, optimizer, scheduler
 
 # Plot and save training history
 def plot_training_history(history, save_dir):
-    plt.figure(figsize=(12, 5))
+    plt.figure(figsize=(15, 5))
     
     # Plot training & validation accuracy
-    plt.subplot(1, 2, 1)
+    plt.subplot(1, 3, 1)
     plt.plot(history['train_acc'], label='Train Accuracy')
     plt.plot(history['val_acc'], label='Validation Accuracy')
     plt.title('Model Accuracy')
@@ -628,7 +662,7 @@ def plot_training_history(history, save_dir):
     plt.legend()
     
     # Plot training & validation loss
-    plt.subplot(1, 2, 2)
+    plt.subplot(1, 3, 2)
     plt.plot(history['train_loss'], label='Train Loss')
     plt.plot(history['val_loss'], label='Validation Loss')
     plt.title('Model Loss')
@@ -636,15 +670,28 @@ def plot_training_history(history, save_dir):
     plt.ylabel('Loss')
     plt.legend()
     
+    # Plot learning rate if available
+    if 'lr' in history and len(history['lr']) > 0:
+        plt.subplot(1, 3, 3)
+        plt.plot(history['lr'], label='Learning Rate')
+        plt.title('Learning Rate')
+        plt.xlabel('Epoch')
+        plt.ylabel('LR')
+        plt.yscale('log')
+    
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, 'training_history.png'))
+    plt.savefig(os.path.join(save_dir, 'training_history.png'), dpi=300)
     plt.close()
 
 
-# Evaluate function with confusion matrix
-def evaluate_model(model, test_loader, class_names, device='cuda', save_dir=None):
+# Memory-efficient evaluation function
+def evaluate_model_memory_efficient(model, test_loader, class_names, device='cuda', save_dir=None):
+    """
+    Memory-efficient model evaluation function
+    """
     if save_dir is None:
         save_dir = os.path.join(ROOT_DIR, 'models')
+    os.makedirs(save_dir, exist_ok=True)
     
     model.eval()
     all_preds = []
@@ -652,22 +699,40 @@ def evaluate_model(model, test_loader, class_names, device='cuda', save_dir=None
     running_corrects = 0
     total_samples = 0
     
-    with torch.no_grad():
-        for inputs, labels in tqdm(test_loader, desc="Evaluating"):
-            inputs = inputs.to(device)
-            labels = labels.to(device)
-            batch_size = inputs.size(0)
-            total_samples += batch_size
-            
-            outputs = model(inputs)
-            _, preds = torch.max(outputs, 1)
-            
-            running_corrects += torch.sum(preds == labels.data)
-            
-            all_preds.extend(preds.cpu().numpy())
-            all_labels.extend(labels.cpu().numpy())
+    print("Evaluating model...")
     
-    test_acc = running_corrects.double() / total_samples
+    with torch.no_grad():
+        for i, (inputs, labels) in enumerate(tqdm(test_loader, desc="Evaluating")):
+            try:
+                inputs = inputs.to(device)
+                labels = labels.to(device)
+                batch_size = inputs.size(0)
+                total_samples += batch_size
+                
+                # Use AMP for memory efficiency
+                with torch.cuda.amp.autocast():
+                    outputs = model(inputs)
+                    _, preds = torch.max(outputs, 1)
+                
+                running_corrects += torch.sum(preds == labels).item()
+                
+                # Add to lists
+                all_preds.extend(preds.cpu().numpy())
+                all_labels.extend(labels.cpu().numpy())
+                
+                # Release memory
+                del inputs, outputs, preds
+                torch.cuda.empty_cache()
+                
+            except RuntimeError as e:
+                if 'out of memory' in str(e):
+                    print(f"WARNING: GPU out of memory in evaluation batch {i}, skipping...")
+                    torch.cuda.empty_cache()
+                    continue
+                else:
+                    raise e
+    
+    test_acc = running_corrects / total_samples
     print(f'Test Accuracy: {test_acc:.4f}')
     
     # Generate confusion matrix
@@ -683,46 +748,102 @@ def evaluate_model(model, test_loader, class_names, device='cuda', save_dir=None
     plt.ylabel('True')
     plt.title('Confusion Matrix')
     plt.tight_layout()
-    plt.savefig(os.path.join(save_dir, 'confusion_matrix.png'))
+    plt.savefig(os.path.join(save_dir, 'confusion_matrix.png'), dpi=300)
+    plt.close()
+    
+    # Generate normalized confusion matrix (in percentage)
+    cm_norm = cm.astype('float') / cm.sum(axis=1)[:, np.newaxis]
+    cm_norm = np.round(cm_norm * 100, 1)  # Convert to percentages
+    
+    plt.figure(figsize=(12, 10))
+    sns.heatmap(
+        cm_norm, annot=True, fmt='.1f', cmap='Blues',
+        xticklabels=class_names, yticklabels=class_names
+    )
+    plt.xlabel('Predicted')
+    plt.ylabel('True')
+    plt.title('Normalized Confusion Matrix (%)')
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'confusion_matrix_normalized.png'), dpi=300)
     plt.close()
     
     # Generate classification report
     report = classification_report(all_labels, all_preds, target_names=class_names, output_dict=True)
+    
+    # Create a more detailed report dataframe
     report_df = pd.DataFrame(report).transpose()
+    
+    # Save reports
     report_df.to_csv(os.path.join(save_dir, 'classification_report.csv'))
     
-    # Also save as a readable text file
+    # Also save as readable text file
     with open(os.path.join(save_dir, 'classification_report.txt'), 'w') as f:
         f.write(classification_report(all_labels, all_preds, target_names=class_names))
+    
+    # Create per-class accuracy bar chart
+    plt.figure(figsize=(14, 8))
+    class_accuracies = [report[name]['precision'] for name in class_names]
+    bars = plt.bar(class_names, class_accuracies, color='skyblue')
+    
+    # Add value labels on top of bars
+    for bar in bars:
+        height = bar.get_height()
+        plt.text(
+            bar.get_x() + bar.get_width()/2.,
+            height + 0.01,
+            f'{height:.2f}',
+            ha='center',
+            fontsize=9
+        )
+    
+    plt.title('Per-Class Accuracy', fontsize=14)
+    plt.ylabel('Accuracy', fontsize=12)
+    plt.xlabel('Class', fontsize=12)
+    plt.ylim(0, 1.1)
+    plt.xticks(rotation=45, ha='right')
+    plt.tight_layout()
+    plt.savefig(os.path.join(save_dir, 'per_class_accuracy.png'), dpi=300)
+    plt.close()
+    
+    # Save a summary of the evaluation
+    with open(os.path.join(save_dir, 'evaluation_summary.txt'), 'w') as f:
+        f.write(f"Overall Test Accuracy: {test_acc:.4f}\n\n")
+        f.write("Per-class Performance:\n")
+        for i, class_name in enumerate(class_names):
+            class_stats = report[class_name]
+            f.write(f"{class_name}:\n")
+            f.write(f"  Precision: {class_stats['precision']:.4f}\n")
+            f.write(f"  Recall: {class_stats['recall']:.4f}\n")
+            f.write(f"  F1-Score: {class_stats['f1-score']:.4f}\n")
+            f.write(f"  Samples: {class_stats['support']}\n\n")
     
     return test_acc, cm, report
 
 
-# Main training pipeline
-def main(config):
-    # Device configuration
-    if config['use_cuda'] and torch.cuda.is_available():
-        device = torch.device('cuda')
-        print(f"Using GPU: {torch.cuda.get_device_name(0)}")
-    else:
-        device = torch.device('cpu')
-        print("Using CPU")
+def main():
+    # Set device
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    print(f"Using device: {device}")
     
-    # Set directories - make sure they are relative to ROOT_DIR
-    train_data_path = os.path.join(ROOT_DIR, config['train_data_path'])
-    test_data_path = os.path.join(ROOT_DIR, config['test_data_path'])
-    model_dir = os.path.join(ROOT_DIR, config['model_dir'])
+    # Get optimal configuration
+    config = get_optimal_config()
     
-    os.makedirs(model_dir, exist_ok=True)
+    # Make sure all directories exist
+    os.makedirs(config['model_dir'], exist_ok=True)
     
-    # Save configuration
-    with open(os.path.join(model_dir, 'config.json'), 'w') as f:
+    # Save configuration to model directory
+    with open(os.path.join(config['model_dir'], 'config.json'), 'w') as f:
         json.dump(config, f, indent=2)
     
-    # Load data with advanced augmentation
-    train_loader, val_loader, test_loader, num_classes, class_names = load_data(
-        train_data_path=train_data_path,
-        test_data_path=test_data_path,
+    # Log beginning of training process
+    print(f"Starting training process for skin disease classification")
+    print(f"Using ROOT_DIR: {ROOT_DIR}")
+    print(f"Models will be saved to: {config['model_dir']}")
+    
+    # Load data with memory-efficient function
+    train_loader, val_loader, test_loader, num_classes, class_names = load_data_memory_efficient(
+        train_data_path=config['train_data_path'],
+        test_data_path=config['test_data_path'],
         img_size=config['img_size'],
         batch_size=config['batch_size'],
         auto_augment=config['auto_augment'],
@@ -733,8 +854,13 @@ def main(config):
     print(f"Number of classes: {num_classes}")
     print(f"Class names: {class_names}")
     
-    # Initialize model with improved architecture
-    model = ViTCNNHybrid(
+    # Save class names for future reference
+    with open(os.path.join(config['model_dir'], 'classes.json'), 'w') as f:
+        class_map = {i: name for i, name in enumerate(class_names)}
+        json.dump(class_map, f, indent=2)
+    
+    # Initialize model
+    model = ImprovedViTCNNHybrid(
         img_size=config['img_size'],
         patch_size=config['patch_size'],
         in_channels=3,
@@ -744,19 +870,17 @@ def main(config):
         num_heads=config['num_heads'],
         dropout=config['dropout'],
         attn_dropout=config['attn_dropout'],
-        cnn_dropout=config['cnn_dropout']
+        cnn_pretrained=config['cnn_pretrained']
     )
     
     # Print model summary
-    print(f"Model parameters: {sum(p.numel() for p in model.parameters() if p.requires_grad):,}")
+    param_count = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Model parameters: {param_count:,}")
     
-    # Loss function - Label smoothing can help with overconfidence
-    if config['label_smoothing'] > 0:
-        criterion = nn.CrossEntropyLoss(label_smoothing=config['label_smoothing'])
-    else:
-        criterion = nn.CrossEntropyLoss()
+    # Loss function with label smoothing
+    criterion = torch.nn.CrossEntropyLoss(label_smoothing=config['label_smoothing'])
     
-    # Optimizer - AdamW with weight decay and correct scheduling
+    # Optimizer with weight decay
     optimizer = torch.optim.AdamW(
         model.parameters(), 
         lr=config['lr'],
@@ -783,8 +907,8 @@ def main(config):
     else:
         scheduler = None
     
-    # Train model with improved training loop
-    trained_model, history = train_model(
+    # Train model with memory-efficient training
+    trained_model, history = train_model_efficient(
         model=model,
         train_loader=train_loader,
         val_loader=val_loader,
@@ -796,19 +920,20 @@ def main(config):
         mixup_alpha=config['mixup_alpha'],
         use_amp=config['use_amp'],
         patience=config['patience'],
-        model_dir=model_dir
+        model_dir=config['model_dir']
     )
     
-    # Evaluate model with detailed metrics
-    test_acc, cm, report = evaluate_model(
+    # Evaluate model
+    test_acc, cm, report = evaluate_model_memory_efficient(
         trained_model, 
         test_loader, 
         class_names,
         device=device,
-        save_dir=model_dir
+        save_dir=config['model_dir']
     )
     
     print(f"Final test accuracy: {test_acc:.4f}")
+    print(f"Model and results saved to: {config['model_dir']}")
     
     # Return results
     return {
@@ -821,48 +946,11 @@ def main(config):
 
 
 if __name__ == "__main__":
-    # Configuration dictionary - modified for train_set and test_set structure
-    config = {
-        # Data configuration
-        'train_data_path': 'train_set',       # Path to training data set
-        'test_data_path': 'test_set',         # Path to test data set
-        'model_dir': 'vitcnn_model',          # Directory to save models and results
-        'validation_split': 0.1,              # Fraction of training data to use for validation
-        
-        # Model parameters
-        'img_size': 224,                   # Input image size
-        'patch_size': 16,                  # Patch size for ViT
-        'embed_dim': 768,                  # Embedding dimension
-        'depth': 8,                        # Number of transformer blocks
-        'num_heads': 12,                   # Number of attention heads
-        'dropout': 0.2,                    # Dropout rate
-        'attn_dropout': 0.1,               # Attention dropout rate
-        'cnn_dropout': 0.1,                # CNN feature extractor dropout
-        
-        # Training parameters
-        'batch_size': 32,                  # Batch size
-        'epochs': 100,                     # Maximum number of epochs
-        'lr': 1e-4,                        # Learning rate
-        'weight_decay': 0.05,              # Weight decay for regularization
-        'label_smoothing': 0.1,            # Label smoothing factor
-        'mixup_alpha': 0.2,                # Mixup alpha parameter
-        'auto_augment': True,              # Use AutoAugment policy
-        'scheduler': 'cosine',             # Learning rate scheduler ('cosine' or 'onecycle')
-        'patience': 10,                    # Early stopping patience
-        
-        # Performance options
-        'use_cuda': True,                  # Use GPU if available
-        'use_amp': True,                   # Use Automatic Mixed Precision
-        'num_workers': 4                   # Number of data loading workers
-    }
+    # Make sure ROOT_DIR exists
+    os.makedirs(ROOT_DIR, exist_ok=True)
     
-    # Print the configuration
-    print("Running with configuration:")
-    for key, value in config.items():
-        print(f"  {key}: {value}")
+    # Run the main function
+    results = main()
     
-    # Run the training pipeline
-    results = main(config)
-    
-    print(f"Training completed. Final test accuracy: {results['test_acc']:.4f}")
-    print(f"Model and results saved to {os.path.join(ROOT_DIR, config['model_dir'])}")
+    print("Training and evaluation completed successfully!")
+    print(f"Best test accuracy: {results['test_acc']:.4f}")
