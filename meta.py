@@ -173,58 +173,75 @@ class DermatologyClassifier(nn.Module):
         # Load state-of-the-art models
         if model_type == 'efficientnet_b0':
             self.backbone = models.efficientnet_b0(pretrained=pretrained)
-            feature_dim = 1280
         elif model_type == 'efficientnet_b3':
             self.backbone = models.efficientnet_b3(pretrained=pretrained)
-            feature_dim = 1536
         elif model_type == 'efficientnet_b7':
             self.backbone = models.efficientnet_b7(pretrained=pretrained)
-            feature_dim = 2560
         elif model_type == 'vit_b_16':
             self.backbone = models.vit_b_16(pretrained=pretrained)
-            feature_dim = 768
         elif model_type == 'vit_l_16':
             self.backbone = models.vit_l_16(pretrained=pretrained)
-            feature_dim = 1024
         elif model_type == 'swin_t':
             self.backbone = models.swin_t(pretrained=pretrained)
-            feature_dim = 768
         elif model_type == 'swin_b':
             self.backbone = models.swin_b(pretrained=pretrained)
-            feature_dim = 1024
         elif model_type == 'maxvit_t':
             self.backbone = models.maxvit_t(pretrained=pretrained)
-            feature_dim = 512
         elif model_type == 'densenet121':
             self.backbone = models.densenet121(pretrained=pretrained)
-            feature_dim = 1024
         elif model_type == 'regnet_y_32gf':
             self.backbone = models.regnet_y_32gf(pretrained=pretrained)
-            feature_dim = 3712
         else:
             raise ValueError(f"Unknown model type: {model_type}")
         
-        # Remove original classifier
+        # ROBUST FEATURE DIMENSION DETECTION - same approach as ConvNeXt fix
+        print("🔍 Detecting actual feature dimensions...")
+        
+        # Remove original classifier first
         if hasattr(self.backbone, 'classifier'):
-            if isinstance(self.backbone.classifier, nn.Sequential):
-                feature_dim = self.backbone.classifier[-1].in_features
-            else:
-                feature_dim = self.backbone.classifier.in_features
+            original_classifier = self.backbone.classifier
             self.backbone.classifier = nn.Identity()
         elif hasattr(self.backbone, 'fc'):
-            feature_dim = self.backbone.fc.in_features
+            original_fc = self.backbone.fc
             self.backbone.fc = nn.Identity()
         elif hasattr(self.backbone, 'head'):
-            feature_dim = self.backbone.head.in_features
+            original_head = self.backbone.head
             self.backbone.head = nn.Identity()
         elif hasattr(self.backbone, 'heads'):
-            feature_dim = self.backbone.heads.head.in_features
+            original_heads = self.backbone.heads
             self.backbone.heads = nn.Identity()
         
-        # Dermatology-optimized classifier
+        # Test with actual image size to get real feature dimensions
+        self.backbone.eval()
+        with torch.no_grad():
+            dummy_input = torch.randn(1, 3, img_size, img_size)
+            dummy_features = self.backbone(dummy_input)
+            
+            print(f"🔧 Raw backbone output shape: {dummy_features.shape}")
+            
+            # Handle different output shapes robustly
+            if len(dummy_features.shape) == 4:  # (batch, channels, height, width)
+                print("🔧 4D output detected - applying global average pooling")
+                dummy_features = F.adaptive_avg_pool2d(dummy_features, (1, 1))
+                dummy_features = dummy_features.view(dummy_features.size(0), -1)
+                self.needs_pooling = True
+            elif len(dummy_features.shape) == 3:  # (batch, seq_len, features)
+                print("🔧 3D output detected - taking mean over sequence")
+                dummy_features = dummy_features.mean(dim=1)
+                self.needs_pooling = False
+            elif len(dummy_features.shape) == 2:  # (batch, features)
+                print("🔧 2D output detected - already flattened")
+                self.needs_pooling = False
+            else:
+                print("🔧 Unknown output shape - flattening")
+                dummy_features = dummy_features.view(dummy_features.size(0), -1)
+                self.needs_pooling = False
+            
+            feature_dim = dummy_features.shape[1]
+            print(f"✅ Final feature dimension: {feature_dim}")
+        
+        # Dermatology-optimized classifier with correct input dimension
         self.classifier = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1) if 'efficientnet' in model_type or 'densenet' in model_type else nn.Identity(),
-            nn.Flatten() if 'efficientnet' in model_type or 'densenet' in model_type else nn.Identity(),
             nn.Dropout(dropout_rate),
             nn.Linear(feature_dim, 512),
             nn.ReLU(inplace=True),
@@ -247,14 +264,22 @@ class DermatologyClassifier(nn.Module):
         print(f"✅ {model_type} created: {total_params:,} parameters")
         print(f"   Feature dimension: {feature_dim}")
         print(f"   Image size: {img_size}x{img_size}")
+        print(f"   Needs pooling: {self.needs_pooling}")
     
     def forward(self, x):
         features = self.backbone(x)
         
-        # Handle different output formats
-        if len(features.shape) > 2:
-            # For models that output feature maps
-            features = F.adaptive_avg_pool2d(features, (1, 1)).flatten(1)
+        # Handle different feature shapes robustly (same as ConvNeXt fix)
+        if self.needs_pooling:
+            if len(features.shape) == 4:  # (batch, channels, height, width)
+                features = F.adaptive_avg_pool2d(features, (1, 1))
+                features = features.view(features.size(0), -1)
+            elif len(features.shape) == 3:  # (batch, seq_len, features)
+                features = features.mean(dim=1)
+            else:
+                features = features.view(features.size(0), -1)
+        elif len(features.shape) > 2:
+            features = features.view(features.size(0), -1)
         
         return self.classifier(features)
     
