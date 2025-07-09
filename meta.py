@@ -660,9 +660,503 @@ def run_medical_convnext_meta_learning(config):
             best_accuracy = current_accuracy
             patience_counter = 0
             
+            # Medical ConvNeXt Meta-Learning - Continuation from torch.save
+
             torch.save({
                 'model_state_dict': model.state_dict(),
                 'epoch': epoch,
                 'accuracy': current_accuracy,
                 'confidence': confidence,
-                '
+                'uncertainty': smooth_uncertainty,
+                'config': config,
+                'history': history,
+                'class_names': class_names
+            }, os.path.join(config['model_dir'], 'best_medical_convnext_meta.pth'))
+            
+            print(f"  💾 NEW BEST MEDICAL MODEL: {current_accuracy*100:.1f}% (saved)")
+        else:
+            patience_counter += 1
+            print(f"  ⏱️  No medical improvement: {patience_counter}/{config['early_stopping_patience']}")
+        
+        # Medical early stopping
+        if patience_counter >= config['early_stopping_patience']:
+            print(f"\n🛑 Medical early stopping after {patience_counter} epochs")
+            print(f"🏥 Medical model training complete")
+            break
+        
+        # Medical success check
+        if current_accuracy >= 0.90:
+            print(f"\n🎯 MEDICAL SUCCESS! 90%+ accuracy achieved: {current_accuracy*100:.1f}%")
+            print(f"🏥 Model ready for medical deployment")
+        
+        # Medical progress visualization every 15 epochs
+        if (epoch + 1) % 15 == 0:
+            plt.figure(figsize=(20, 10))
+            
+            # Medical accuracy plot
+            plt.subplot(2, 3, 1)
+            plt.plot(history['task_acc'], alpha=0.5, label='Raw Medical Accuracy', color='lightblue')
+            plt.plot(history['smoothed_acc'], linewidth=2, label='Smoothed Medical Accuracy', color='blue')
+            plt.axhline(y=0.9, color='green', linestyle='--', label='90% Medical Target')
+            plt.axhline(y=0.95, color='red', linestyle='--', label='95% Medical Target')
+            plt.title('Medical Prediction Accuracy', fontsize=14)
+            plt.ylabel('Accuracy')
+            plt.xlabel('Epoch')
+            plt.legend()
+            plt.grid(True, alpha=0.3)
+            
+            # Medical loss plot
+            plt.subplot(2, 3, 2)
+            plt.plot(history['meta_loss'], color='orange', linewidth=2)
+            plt.title('Medical Meta Loss', fontsize=14)
+            plt.ylabel('Loss')
+            plt.xlabel('Epoch')
+            plt.grid(True, alpha=0.3)
+            
+            # Medical adaptation quality
+            plt.subplot(2, 3, 3)
+            plt.plot(history['inner_improvement'], color='purple', linewidth=2)
+            plt.title('Medical Adaptation Quality', fontsize=14)
+            plt.ylabel('Inner Improvement')
+            plt.xlabel('Epoch')
+            plt.grid(True, alpha=0.3)
+            
+            # Medical confidence
+            plt.subplot(2, 3, 4)
+            plt.plot(history['medical_confidence'], color='green', linewidth=2)
+            plt.title('Medical Prediction Confidence', fontsize=14)
+            plt.ylabel('Confidence')
+            plt.xlabel('Epoch')
+            plt.grid(True, alpha=0.3)
+            
+            # Medical uncertainty
+            plt.subplot(2, 3, 5)
+            plt.plot(history['medical_uncertainty'], color='red', linewidth=2)
+            plt.title('Medical Prediction Uncertainty', fontsize=14)
+            plt.ylabel('Uncertainty')
+            plt.xlabel('Epoch')
+            plt.grid(True, alpha=0.3)
+            
+            # Medical performance summary
+            plt.subplot(2, 3, 6)
+            epochs = range(1, len(history['smoothed_acc']) + 1)
+            plt.fill_between(epochs, history['smoothed_acc'], alpha=0.3, color='blue')
+            plt.plot(epochs, history['smoothed_acc'], linewidth=2, color='blue')
+            plt.axhline(y=0.9, color='green', linestyle='--', alpha=0.7)
+            plt.title('Medical Model Performance Summary', fontsize=14)
+            plt.ylabel('Accuracy')
+            plt.xlabel('Epoch')
+            plt.grid(True, alpha=0.3)
+            
+            plt.suptitle(f'Medical ConvNeXt Meta-Learning Progress - Epoch {epoch+1}', fontsize=16)
+            plt.tight_layout()
+            plt.savefig(os.path.join(config['model_dir'], f'medical_convnext_progress_epoch_{epoch+1}.png'), dpi=150)
+            plt.show()
+    
+    print(f"\n🏥 MEDICAL ConvNeXt Meta-Learning COMPLETED!")
+    print(f"🎯 Best medical accuracy achieved: {best_accuracy*100:.1f}%")
+    
+    # Medical performance summary
+    if best_accuracy >= 0.95:
+        print("🎉 OUTSTANDING: 95%+ medical accuracy - EXCELLENT for clinical deployment!")
+    elif best_accuracy >= 0.90:
+        print("🏥 EXCELLENT: 90%+ medical accuracy - READY for medical applications!")
+    elif best_accuracy >= 0.85:
+        print("✅ VERY GOOD: 85%+ medical accuracy - Good medical performance")
+    elif best_accuracy >= 0.80:
+        print("📈 GOOD: 80%+ medical accuracy - Reasonable medical performance")
+    else:
+        print("🔄 MODERATE: Medical model needs more training or data")
+    
+    print(f"\n🏥 Medical Model Summary:")
+    print(f"   Final medical accuracy: {best_accuracy*100:.1f}%")
+    print(f"   Medical conditions trained: {num_classes}")
+    print(f"   Model architecture: ConvNeXt-{config['convnext_variant']}")
+    print(f"   Ready for medical inference: {'YES' if best_accuracy >= 0.85 else 'NEEDS MORE TRAINING'}")
+    
+    return model, history
+
+# Medical inference function optimized for clinical use
+def medical_inference(model_path, image_path, device='cuda', uncertainty_samples=20):
+    """
+    Run medical inference with uncertainty estimation
+    
+    Args:
+        model_path: Path to the trained medical model
+        image_path: Path to the medical image
+        device: Device for inference
+        uncertainty_samples: Number of samples for uncertainty estimation
+    
+    Returns:
+        Dictionary with medical predictions and uncertainty
+    """
+    from PIL import Image
+    import torch.nn.functional as F
+    
+    print(f"🏥 Loading medical model from {model_path}")
+    
+    # Load medical checkpoint
+    checkpoint = torch.load(model_path, map_location='cpu')
+    
+    # Create medical model
+    model = MedicalConvNeXt(
+        num_classes=checkpoint.get('config', {}).get('n_way', 2),
+        variant=checkpoint.get('config', {}).get('convnext_variant', 'tiny'),
+        freeze_backbone=checkpoint.get('config', {}).get('freeze_backbone', False)
+    )
+    
+    # Load medical weights
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model = model.to(device)
+    
+    # Get medical class names
+    class_names = checkpoint.get('class_names', [f"Condition {i}" for i in range(model.num_classes)])
+    
+    print(f"🏥 Medical model loaded: {len(class_names)} conditions")
+    for i, condition in enumerate(class_names):
+        print(f"   {i}: {condition}")
+    
+    # Load and preprocess medical image
+    print(f"🏥 Processing medical image: {image_path}")
+    img = Image.open(image_path).convert('RGB')
+    
+    # Medical image preprocessing
+    transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
+    img_tensor = transform(img).unsqueeze(0).to(device)
+    
+    # Medical inference with uncertainty estimation
+    print(f"🏥 Running medical inference with uncertainty estimation...")
+    
+    model.eval()
+    predictions = []
+    
+    # Multiple forward passes for uncertainty estimation
+    for _ in range(uncertainty_samples):
+        model.train()  # Enable dropout for uncertainty
+        with torch.no_grad():
+            output = model(img_tensor)
+            prob = F.softmax(output, dim=1)
+            predictions.append(prob.cpu())
+    
+    # Calculate medical prediction statistics
+    predictions = torch.stack(predictions)
+    mean_prediction = predictions.mean(dim=0)[0]
+    std_prediction = predictions.std(dim=0)[0]
+    
+    # Medical results
+    medical_results = []
+    
+    for i, (mean_prob, std_prob) in enumerate(zip(mean_prediction, std_prediction)):
+        condition_name = class_names[i]
+        
+        # Clean up condition name if needed
+        if '.' in condition_name and condition_name.split('.')[0].isdigit():
+            clean_name = ' '.join(condition_name.split('.')[1:]).strip()
+            if clean_name.split()[-1].isdigit():  # Remove trailing numbers
+                clean_name = ' '.join(clean_name.split()[:-1])
+        else:
+            clean_name = condition_name
+        
+        medical_results.append({
+            'rank': i + 1,
+            'condition': clean_name,
+            'probability': float(mean_prob),
+            'uncertainty': float(std_prob),
+            'confidence_percentage': f"{float(mean_prob) * 100:.1f}%",
+            'uncertainty_percentage': f"{float(std_prob) * 100:.1f}%"
+        })
+    
+    # Sort by probability (highest first)
+    medical_results.sort(key=lambda x: x['probability'], reverse=True)
+    
+    # Update ranks after sorting
+    for i, result in enumerate(medical_results):
+        result['rank'] = i + 1
+    
+    # Calculate overall prediction confidence
+    top_prediction = medical_results[0]
+    overall_confidence = top_prediction['probability']
+    overall_uncertainty = top_prediction['uncertainty']
+    
+    # Medical interpretation
+    if overall_confidence > 0.9:
+        interpretation = "High confidence prediction"
+    elif overall_confidence > 0.7:
+        interpretation = "Moderate confidence prediction"
+    elif overall_confidence > 0.5:
+        interpretation = "Low confidence prediction"
+    else:
+        interpretation = "Very uncertain prediction - recommend expert review"
+    
+    if overall_uncertainty > 0.2:
+        interpretation += " with high uncertainty"
+    elif overall_uncertainty > 0.1:
+        interpretation += " with moderate uncertainty"
+    else:
+        interpretation += " with low uncertainty"
+    
+    return {
+        'medical_image': image_path,
+        'predictions': medical_results,
+        'top_prediction': {
+            'condition': top_prediction['condition'],
+            'confidence': top_prediction['confidence_percentage'],
+            'uncertainty': top_prediction['uncertainty_percentage']
+        },
+        'medical_interpretation': interpretation,
+        'overall_confidence': overall_confidence,
+        'overall_uncertainty': overall_uncertainty,
+        'model_info': {
+            'architecture': f"ConvNeXt-{checkpoint.get('config', {}).get('convnext_variant', 'tiny')}",
+            'accuracy': f"{checkpoint.get('accuracy', 0)*100:.1f}%",
+            'trained_conditions': len(class_names)
+        },
+        'clinical_notes': {
+            'recommendation': "Always consult with medical professionals for clinical decisions",
+            'uncertainty_threshold': "Consider expert review if uncertainty > 20%",
+            'confidence_threshold': "High confidence predictions (>90%) are most reliable"
+        }
+    }
+
+# Example medical inference usage
+def run_medical_example():
+    """Example of how to use the medical model for inference"""
+    
+    # Example usage (uncomment to use):
+    """
+    medical_results = medical_inference(
+        model_path='/mnt/Test/SC202/trained_models/best_medical_convnext_meta.pth',
+        image_path='/path/to/medical/image.jpg',
+        device='cuda',
+        uncertainty_samples=20
+    )
+    
+    print("🏥 MEDICAL PREDICTION RESULTS:")
+    print(f"Image: {medical_results['medical_image']}")
+    print(f"Top Prediction: {medical_results['top_prediction']['condition']}")
+    print(f"Confidence: {medical_results['top_prediction']['confidence']}")
+    print(f"Uncertainty: {medical_results['top_prediction']['uncertainty']}")
+    print(f"Interpretation: {medical_results['medical_interpretation']}")
+    
+    print("\n🏥 ALL PREDICTIONS:")
+    for pred in medical_results['predictions']:
+        print(f"{pred['rank']}. {pred['condition']}: {pred['confidence_percentage']} (±{pred['uncertainty_percentage']})")
+    
+    print(f"\n🏥 MODEL INFO:")
+    print(f"Architecture: {medical_results['model_info']['architecture']}")
+    print(f"Training Accuracy: {medical_results['model_info']['accuracy']}")
+    print(f"Trained Conditions: {medical_results['model_info']['trained_conditions']}")
+    
+    print(f"\n🏥 CLINICAL NOTES:")
+    for note, value in medical_results['clinical_notes'].items():
+        print(f"{note.title()}: {value}")
+    """
+    
+    pass
+
+# Additional medical utilities
+def evaluate_medical_model(model_path, test_data_dir, device='cuda'):
+    """
+    Evaluate the trained medical model on test data
+    
+    Args:
+        model_path: Path to the trained medical model
+        test_data_dir: Path to test data directory
+        device: Device for evaluation
+    
+    Returns:
+        Dictionary with evaluation metrics
+    """
+    print(f"🏥 Evaluating medical model on test data...")
+    
+    # Load medical checkpoint
+    checkpoint = torch.load(model_path, map_location='cpu')
+    
+    # Create medical model
+    model = MedicalConvNeXt(
+        num_classes=checkpoint.get('config', {}).get('n_way', 2),
+        variant=checkpoint.get('config', {}).get('convnext_variant', 'tiny'),
+        freeze_backbone=checkpoint.get('config', {}).get('freeze_backbone', False)
+    )
+    
+    # Load medical weights
+    model.load_state_dict(checkpoint['model_state_dict'])
+    model = model.to(device)
+    model.eval()
+    
+    # Load test data
+    test_transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
+    test_dataset = datasets.ImageFolder(root=test_data_dir, transform=test_transform)
+    test_loader = DataLoader(test_dataset, batch_size=16, shuffle=False, num_workers=2)
+    
+    # Evaluation metrics
+    correct = 0
+    total = 0
+    class_correct = {}
+    class_total = {}
+    all_predictions = []
+    all_labels = []
+    all_confidences = []
+    
+    print(f"🏥 Evaluating on {len(test_dataset)} test images...")
+    
+    with torch.no_grad():
+        for inputs, labels in tqdm(test_loader, desc="Medical evaluation"):
+            inputs, labels = inputs.to(device), labels.to(device)
+            
+            outputs = model(inputs)
+            probs = F.softmax(outputs, dim=1)
+            _, predicted = torch.max(outputs, 1)
+            
+            total += labels.size(0)
+            correct += (predicted == labels).sum().item()
+            
+            # Per-class metrics
+            for label, pred, prob in zip(labels, predicted, probs):
+                label_item = label.item()
+                pred_item = pred.item()
+                confidence = prob.max().item()
+                
+                if label_item not in class_correct:
+                    class_correct[label_item] = 0
+                    class_total[label_item] = 0
+                
+                class_total[label_item] += 1
+                if label_item == pred_item:
+                    class_correct[label_item] += 1
+                
+                all_predictions.append(pred_item)
+                all_labels.append(label_item)
+                all_confidences.append(confidence)
+    
+    # Calculate metrics
+    overall_accuracy = correct / total
+    class_accuracies = {cls: class_correct[cls] / class_total[cls] 
+                       for cls in class_correct.keys()}
+    
+    # Confidence analysis
+    avg_confidence = np.mean(all_confidences)
+    high_conf_predictions = [conf for conf in all_confidences if conf > 0.9]
+    high_conf_percentage = len(high_conf_predictions) / len(all_confidences) * 100
+    
+    results = {
+        'overall_accuracy': overall_accuracy,
+        'class_accuracies': class_accuracies,
+        'average_confidence': avg_confidence,
+        'high_confidence_percentage': high_conf_percentage,
+        'total_samples': total,
+        'correct_predictions': correct
+    }
+    
+    print(f"\n🏥 MEDICAL MODEL EVALUATION RESULTS:")
+    print(f"   Overall Accuracy: {overall_accuracy*100:.2f}%")
+    print(f"   Average Confidence: {avg_confidence:.3f}")
+    print(f"   High Confidence Predictions (>90%): {high_conf_percentage:.1f}%")
+    print(f"   Total Test Samples: {total}")
+    
+    print(f"\n🏥 Per-Class Accuracies:")
+    class_names = test_dataset.classes
+    for cls_idx, accuracy in class_accuracies.items():
+        class_name = class_names[cls_idx] if cls_idx < len(class_names) else f"Class {cls_idx}"
+        print(f"   {class_name}: {accuracy*100:.2f}%")
+    
+    return results
+
+# Medical model deployment helper
+def deploy_medical_model(model_path, deployment_dir):
+    """
+    Prepare medical model for deployment
+    
+    Args:
+        model_path: Path to the trained medical model
+        deployment_dir: Directory to save deployment files
+    """
+    print(f"🏥 Preparing medical model for deployment...")
+    
+    os.makedirs(deployment_dir, exist_ok=True)
+    
+    # Load checkpoint
+    checkpoint = torch.load(model_path, map_location='cpu')
+    
+    # Create deployment info
+    deployment_info = {
+        'model_architecture': f"ConvNeXt-{checkpoint.get('config', {}).get('convnext_variant', 'tiny')}",
+        'training_accuracy': f"{checkpoint.get('accuracy', 0)*100:.1f}%",
+        'medical_conditions': checkpoint.get('class_names', []),
+        'input_size': checkpoint.get('config', {}).get('img_size', 224),
+        'deployment_date': time.strftime('%Y-%m-%d %H:%M:%S'),
+        'model_type': 'Medical Image Classification',
+        'uncertainty_estimation': True,
+        'clinical_notes': {
+            'purpose': 'Medical image classification with uncertainty estimation',
+            'disclaimer': 'For research purposes only. Always consult medical professionals.',
+            'confidence_threshold': 'High confidence: >90%, Moderate: 70-90%, Low: <70%',
+            'uncertainty_threshold': 'Review if uncertainty >20%'
+        }
+    }
+    
+    # Save deployment files
+    import json
+    with open(os.path.join(deployment_dir, 'model_info.json'), 'w') as f:
+        json.dump(deployment_info, f, indent=2)
+    
+    # Copy model file
+    import shutil
+    shutil.copy2(model_path, os.path.join(deployment_dir, 'medical_model.pth'))
+    
+    # Create inference script
+    inference_script = f"""
+# Medical Model Inference Script
+import torch
+from medical_inference import medical_inference
+
+# Example usage:
+results = medical_inference(
+    model_path='{deployment_dir}/medical_model.pth',
+    image_path='path/to/medical/image.jpg',
+    device='cuda'
+)
+
+print("Medical Prediction:", results['top_prediction'])
+print("Confidence:", results['top_prediction']['confidence'])
+print("Interpretation:", results['medical_interpretation'])
+"""
+    
+    with open(os.path.join(deployment_dir, 'inference_example.py'), 'w') as f:
+        f.write(inference_script)
+    
+    print(f"✅ Medical model deployed to: {deployment_dir}")
+    print(f"   📁 model_info.json - Model metadata")
+    print(f"   📁 medical_model.pth - Model weights")
+    print(f"   📁 inference_example.py - Usage example")
+
+# Run the medical meta-learning
+if __name__ == "__main__":
+    print("🏥 Starting MEDICAL ConvNeXt Meta-Learning")
+    print("🎯 Optimized for medical image prediction with uncertainty estimation")
+    print("⚕️  Features: Medical augmentation, uncertainty modeling, clinical-grade accuracy")
+    
+    # Run medical training
+    model, history = run_medical_convnext_meta_learning(medical_config)
+    
+    print("\n🏥 Medical meta-learning training completed!")
+    print("🎯 Model ready for medical inference with uncertainty estimation")
+    print("⚕️  Use medical_inference() function for clinical predictions")
+    
+    # Optional: Deploy the model
+    # deploy_medical_model(
+    #     model_path='/mnt/Test/SC202/trained_models/best_medical_convnext_meta.pth',
+    #     deployment_dir='/mnt/Test/SC202/medical_deployment'
+    # )
