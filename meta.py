@@ -109,23 +109,39 @@ class PretrainedConvNeXtMeta(nn.Module):
         print(f"Loading pretrained ConvNeXt-{variant}...")
         if variant == 'tiny':
             self.backbone = models.convnext_tiny(pretrained=True)
-            feature_dim = 768
         elif variant == 'small':
             self.backbone = models.convnext_small(pretrained=True)
-            feature_dim = 768
         elif variant == 'base':
             self.backbone = models.convnext_base(pretrained=True)
-            feature_dim = 1024
         elif variant == 'large':
             self.backbone = models.convnext_large(pretrained=True)
-            feature_dim = 1536
         else:
             raise ValueError(f"Unknown ConvNeXt variant: {variant}")
         
-        print(f"✅ Loaded ConvNeXt-{variant} with {feature_dim}-dim features")
+        # DYNAMIC FEATURE DETECTION: Run a dummy forward pass to get actual feature size
+        print("🔍 Detecting actual feature dimensions...")
+        self.backbone.eval()
+        with torch.no_grad():
+            dummy_input = torch.randn(1, 3, 224, 224)
+            dummy_features = self.backbone(dummy_input)
+            actual_feature_dim = dummy_features.shape[1]
         
-        # Remove the original classifier
+        print(f"✅ Loaded ConvNeXt-{variant} with {actual_feature_dim}-dim features")
+        
+        # Remove the original classifier and replace with identity
         self.backbone.classifier = nn.Identity()
+        
+        # Verify the feature dimension again after removing classifier
+        with torch.no_grad():
+            dummy_features = self.backbone(dummy_input)
+            if len(dummy_features.shape) > 2:
+                # If features are not flattened, flatten them
+                feature_dim = dummy_features.view(dummy_features.size(0), -1).shape[1]
+                print(f"🔧 Features need flattening. Actual dimension: {feature_dim}")
+                self.needs_flatten = True
+            else:
+                feature_dim = dummy_features.shape[1]
+                self.needs_flatten = False
         
         # Freeze backbone if requested
         if freeze_backbone:
@@ -135,7 +151,7 @@ class PretrainedConvNeXtMeta(nn.Module):
         else:
             print("🔓 Backbone parameters will be fine-tuned")
         
-        # Create new classifier for few-shot learning
+        # Create new classifier with correct input dimension
         self.classifier = nn.Sequential(
             nn.Dropout(dropout_rate),
             nn.Linear(feature_dim, 512),
@@ -151,6 +167,7 @@ class PretrainedConvNeXtMeta(nn.Module):
                 nn.init.constant_(m.bias, 0)
         
         print(f"📊 Model created with {self.count_parameters():,} total parameters")
+        print(f"📊 Feature dimension: {feature_dim}")
         if freeze_backbone:
             trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
             print(f"📊 Trainable parameters: {trainable:,} (classifier only)")
@@ -161,6 +178,11 @@ class PretrainedConvNeXtMeta(nn.Module):
     def forward(self, x):
         # Extract features with pretrained backbone
         features = self.backbone(x)
+        
+        # Flatten if necessary
+        if self.needs_flatten:
+            features = features.view(features.size(0), -1)
+        
         # Classify with new head
         output = self.classifier(features)
         return output
