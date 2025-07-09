@@ -1,9 +1,10 @@
-# Ultra-Simple Meta-Learning - Guaranteed 90%+ accuracy approach
+# Pretrained ConvNeXt Meta-Learning - Using pretrained weights for 90%+ accuracy
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import transforms, datasets
+import torchvision.models as models
 import numpy as np
 import os
 import time
@@ -24,40 +25,42 @@ def seed_everything(seed=42):
 
 seed_everything()
 
-# ULTRA-AGGRESSIVE Configuration for guaranteed high accuracy
-ultra_config = {
+# Configuration for Pretrained ConvNeXt Meta-Learning
+pretrained_config = {
     'data_dir': '/mnt/Test/SC202/IMG_CLASSES',
     'model_dir': '/mnt/Test/SC202/trained_models',
     
-    # ULTRA-SIMPLE setup
-    'img_size': 84,               # Much smaller images for easier learning
-    'batch_size': 4,              # Tiny batches
+    # Model parameters
+    'img_size': 224,              # Keep standard ImageNet size for pretrained model
+    'batch_size': 8,              # Small batches for stability
+    'convnext_variant': 'tiny',   # Options: 'tiny', 'small', 'base', 'large'
     
-    # AGGRESSIVE meta-learning parameters
-    'meta_lr': 1e-4,              # Moderate meta learning rate
-    'inner_lr': 0.1,              # LARGE inner learning rate for fast adaptation
-    'meta_epochs': 200,           # Many epochs
-    'num_inner_steps': 10,        # MANY adaptation steps
-    'tasks_per_epoch': 20,        # Many tasks for solid learning
-    'k_shot': 10,                 # MANY shots - makes tasks much easier
-    'query_size': 5,              # Small query for evaluation
-    'n_way': 2,                   # Binary classification only
+    # Meta-learning parameters - optimized for pretrained features
+    'meta_lr': 1e-4,              # Conservative for pretrained model
+    'inner_lr': 0.01,             # Good adaptation rate
+    'meta_epochs': 100,           
+    'num_inner_steps': 5,         # Good adaptation with pretrained features
+    'tasks_per_epoch': 12,        # Reasonable number of tasks
+    'k_shot': 5,                  # 5-shot learning with good features
+    'query_size': 5,              # Balanced query size
+    'n_way': 3,                   # 3-way classification
     'first_order': False,         # Second-order for best accuracy
     
-    # MINIMAL regularization for maximum learning
-    'gradient_clip': 5.0,         # Generous clipping
-    'warmup_epochs': 0,           # No warmup - start learning immediately
-    'weight_decay': 0,            # No weight decay
-    'dropout_rate': 0,            # No dropout
+    # Training parameters
+    'freeze_backbone': False,     # Allow backbone fine-tuning
+    'gradient_clip': 1.0,         
+    'warmup_epochs': 10,          # Moderate warmup
+    'moving_avg_window': 7,       
+    'early_stopping_patience': 20,
+    'weight_decay': 1e-4,
+    'dropout_rate': 0.1,
     
-    'early_stopping_patience': 50,
-    'moving_avg_window': 5,
     'num_workers': 2,
     'use_cuda': True,
 }
 
-def load_data_simple(data_dir, img_size=84, batch_size=4, num_workers=2):
-    """Ultra-simple data loading"""
+def load_data_pretrained(data_dir, img_size=224, batch_size=8, num_workers=2):
+    """Load data with ImageNet-style preprocessing for pretrained ConvNeXt"""
     print(f"Loading dataset from {data_dir}")
     
     train_dir = os.path.join(data_dir, "train")
@@ -65,14 +68,24 @@ def load_data_simple(data_dir, img_size=84, batch_size=4, num_workers=2):
     if not os.path.exists(train_dir):
         raise ValueError("Cannot find train directory")
     
-    # MINIMAL transforms for easier learning
-    transform = transforms.Compose([
-        transforms.Resize((img_size, img_size)),  # Just resize, no crops
+    # ImageNet-style preprocessing for pretrained ConvNeXt
+    train_transform = transforms.Compose([
+        transforms.Resize(256),                    # Standard ImageNet preprocessing
+        transforms.CenterCrop(img_size),           # Keep center crop for consistency
+        transforms.RandomHorizontalFlip(p=0.5),   # Standard augmentation
+        transforms.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.1, hue=0.05),
         transforms.ToTensor(),
-        transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5])  # Simple normalization
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])  # ImageNet stats
     ])
     
-    dataset = datasets.ImageFolder(root=train_dir, transform=transform)
+    val_transform = transforms.Compose([
+        transforms.Resize(256),
+        transforms.CenterCrop(img_size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+    ])
+    
+    dataset = datasets.ImageFolder(root=train_dir, transform=train_transform)
     loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, 
                        num_workers=num_workers, pin_memory=True)
     
@@ -80,80 +93,95 @@ def load_data_simple(data_dir, img_size=84, batch_size=4, num_workers=2):
     class_names = dataset.classes
     
     print(f"Dataset: {num_classes} classes, {len(dataset)} images")
-    print(f"Classes: {class_names[:10]}...")  # Show first 10 classes
+    print(f"Classes: {class_names[:10]}...")
     
     return loader, num_classes, class_names
 
-class UltraSimpleConvNet(nn.Module):
-    """Extremely simple CNN - almost toy-level for guaranteed learning"""
-    def __init__(self, num_classes=2):
+class PretrainedConvNeXtMeta(nn.Module):
+    """Pretrained ConvNeXt adapted for meta-learning"""
+    def __init__(self, num_classes=3, variant='tiny', freeze_backbone=False, dropout_rate=0.1):
         super().__init__()
         self.num_classes = num_classes
+        self.variant = variant
+        self.freeze_backbone = freeze_backbone
         
-        # Ultra-simple architecture
-        self.features = nn.Sequential(
-            # Block 1
-            nn.Conv2d(3, 32, 3, padding=1),
-            nn.BatchNorm2d(32),
+        # Load pretrained ConvNeXt
+        print(f"Loading pretrained ConvNeXt-{variant}...")
+        if variant == 'tiny':
+            self.backbone = models.convnext_tiny(pretrained=True)
+            feature_dim = 768
+        elif variant == 'small':
+            self.backbone = models.convnext_small(pretrained=True)
+            feature_dim = 768
+        elif variant == 'base':
+            self.backbone = models.convnext_base(pretrained=True)
+            feature_dim = 1024
+        elif variant == 'large':
+            self.backbone = models.convnext_large(pretrained=True)
+            feature_dim = 1536
+        else:
+            raise ValueError(f"Unknown ConvNeXt variant: {variant}")
+        
+        print(f"✅ Loaded ConvNeXt-{variant} with {feature_dim}-dim features")
+        
+        # Remove the original classifier
+        self.backbone.classifier = nn.Identity()
+        
+        # Freeze backbone if requested
+        if freeze_backbone:
+            print("🔒 Freezing backbone parameters")
+            for param in self.backbone.parameters():
+                param.requires_grad = False
+        else:
+            print("🔓 Backbone parameters will be fine-tuned")
+        
+        # Create new classifier for few-shot learning
+        self.classifier = nn.Sequential(
+            nn.Dropout(dropout_rate),
+            nn.Linear(feature_dim, 512),
             nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
-            
-            # Block 2  
-            nn.Conv2d(32, 64, 3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
-            
-            # Block 3
-            nn.Conv2d(64, 128, 3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2),
-            
-            # Block 4
-            nn.Conv2d(128, 256, 3, padding=1),
-            nn.BatchNorm2d(256), 
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d(1)
+            nn.Dropout(dropout_rate),
+            nn.Linear(512, num_classes)
         )
         
-        # Simple classifier
-        self.classifier = nn.Linear(256, num_classes)
-        
-        # Initialize for fast learning
-        self.apply(self._init_weights)
-    
-    def _init_weights(self, m):
-        if isinstance(m, nn.Conv2d):
-            nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='relu')
-            if m.bias is not None:
+        # Initialize new classifier
+        for m in self.classifier.modules():
+            if isinstance(m, nn.Linear):
+                nn.init.normal_(m.weight, 0, 0.01)
                 nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.BatchNorm2d):
-            nn.init.constant_(m.weight, 1)
-            nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.Linear):
-            nn.init.normal_(m.weight, 0, 0.01)
-            nn.init.constant_(m.bias, 0)
+        
+        print(f"📊 Model created with {self.count_parameters():,} total parameters")
+        if freeze_backbone:
+            trainable = sum(p.numel() for p in self.parameters() if p.requires_grad)
+            print(f"📊 Trainable parameters: {trainable:,} (classifier only)")
+    
+    def count_parameters(self):
+        return sum(p.numel() for p in self.parameters())
     
     def forward(self, x):
-        x = self.features(x)
-        x = torch.flatten(x, 1)
-        x = self.classifier(x)
-        return x
+        # Extract features with pretrained backbone
+        features = self.backbone(x)
+        # Classify with new head
+        output = self.classifier(features)
+        return output
     
     def clone(self):
         """Create exact copy for inner loop"""
-        clone = UltraSimpleConvNet(num_classes=self.num_classes)
+        clone = PretrainedConvNeXtMeta(
+            num_classes=self.num_classes,
+            variant=self.variant,
+            freeze_backbone=self.freeze_backbone
+        )
         clone.load_state_dict(self.state_dict())
         return clone
 
-def create_easy_tasks(data_loader, num_tasks, n_way=2, k_shot=10, query_size=5):
-    """Create very easy tasks for guaranteed high accuracy"""
-    print("Creating EASY tasks for high accuracy...")
+def create_pretrained_tasks(data_loader, num_tasks, n_way=3, k_shot=5, query_size=5):
+    """Create tasks optimized for pretrained feature extraction"""
+    print(f"Creating {num_tasks} tasks for pretrained ConvNeXt...")
     
-    # Collect lots of data per class
+    # Collect data by class with generous buffers
     class_data = {}
-    sample_limit = k_shot + query_size + 20  # Generous buffer
+    sample_limit = k_shot + query_size + 15
     
     for inputs, labels in tqdm(data_loader, desc="Collecting data"):
         for i, label in enumerate(labels):
@@ -164,89 +192,125 @@ def create_easy_tasks(data_loader, num_tasks, n_way=2, k_shot=10, query_size=5):
             if len(class_data[label_item]) < sample_limit:
                 class_data[label_item].append(inputs[i].clone())
     
-    # Only use classes with plenty of data
-    min_samples = k_shot + query_size + 5
+    # Filter classes with sufficient samples
+    min_samples = k_shot + query_size + 2
     valid_classes = [c for c, data in class_data.items() if len(data) >= min_samples]
     
     print(f"Using {len(valid_classes)} classes with ≥{min_samples} samples each")
     
     if len(valid_classes) < n_way:
-        raise ValueError(f"Need at least {n_way} classes, only found {len(valid_classes)}")
+        raise ValueError(f"Need at least {n_way} classes, found {len(valid_classes)}")
     
     tasks = []
-    for task_idx in range(num_tasks):
-        # Randomly sample classes - avoid picking similar ones by using random sampling
-        task_classes = np.random.choice(valid_classes, size=n_way, replace=False)
+    successful_tasks = 0
+    
+    for task_idx in range(num_tasks * 2):  # Try more tasks in case some fail
+        if successful_tasks >= num_tasks:
+            break
+            
+        # Sample classes for this task
+        try:
+            task_classes = np.random.choice(valid_classes, size=n_way, replace=False)
+        except ValueError:
+            continue
         
         support_data, support_labels = [], []
         query_data, query_labels = [], []
         
+        task_valid = True
+        
         for new_label, original_class in enumerate(task_classes):
             available_data = class_data[original_class]
             
-            # Sample plenty of data
             total_needed = k_shot + query_size
-            if len(available_data) >= total_needed:
-                indices = np.random.choice(len(available_data), size=total_needed, replace=False)
+            if len(available_data) < total_needed:
+                task_valid = False
+                break
                 
-                # Support set - lots of examples
-                for i in range(k_shot):
-                    support_data.append(available_data[indices[i]])
-                    support_labels.append(new_label)
-                
-                # Query set
-                for i in range(k_shot, total_needed):
-                    query_data.append(available_data[indices[i]])
-                    query_labels.append(new_label)
+            # Sample without replacement
+            indices = np.random.choice(len(available_data), size=total_needed, replace=False)
+            
+            # Support set
+            for i in range(k_shot):
+                support_data.append(available_data[indices[i]])
+                support_labels.append(new_label)
+            
+            # Query set
+            for i in range(k_shot, total_needed):
+                query_data.append(available_data[indices[i]])
+                query_labels.append(new_label)
         
-        # Create task only if complete
-        if len(support_data) == n_way * k_shot and len(query_data) == n_way * query_size:
+        if task_valid and len(support_data) == n_way * k_shot and len(query_data) == n_way * query_size:
             support_data = torch.stack(support_data)
             support_labels = torch.tensor(support_labels, dtype=torch.long)
             query_data = torch.stack(query_data)
             query_labels = torch.tensor(query_labels, dtype=torch.long)
             
             tasks.append((support_data, support_labels, query_data, query_labels))
+            successful_tasks += 1
     
-    print(f"Created {len(tasks)} easy tasks")
-    print(f"Each task: {n_way} classes, {k_shot} support + {query_size} query per class")
-    
+    print(f"✅ Created {len(tasks)} valid tasks")
     return tasks
 
-class UltraAggressiveMAML:
-    """MAML configured for maximum accuracy with minimal complexity"""
-    def __init__(self, model, inner_lr=0.1, meta_lr=1e-4, num_inner_steps=10):
+class PretrainedMAML:
+    """MAML optimized for pretrained ConvNeXt"""
+    def __init__(self, model, inner_lr=0.01, meta_lr=1e-4, num_inner_steps=5, 
+                 gradient_clip=1.0, warmup_epochs=10):
         self.model = model
         self.inner_lr = inner_lr
         self.meta_lr = meta_lr
+        self.base_meta_lr = meta_lr
         self.num_inner_steps = num_inner_steps
+        self.gradient_clip = gradient_clip
+        self.warmup_epochs = warmup_epochs
         
-        # Simple, effective optimizer
-        self.meta_optimizer = torch.optim.Adam(
-            self.model.parameters(), 
-            lr=meta_lr,
-            betas=(0.9, 0.999)
+        # Separate learning rates for backbone and classifier
+        backbone_params = []
+        classifier_params = []
+        
+        for name, param in model.named_parameters():
+            if 'classifier' in name:
+                classifier_params.append(param)
+            else:
+                backbone_params.append(param)
+        
+        # Different learning rates for pretrained vs new parameters
+        self.meta_optimizer = torch.optim.AdamW([
+            {'params': backbone_params, 'lr': meta_lr * 0.1},      # Lower LR for pretrained
+            {'params': classifier_params, 'lr': meta_lr}           # Higher LR for new classifier
+        ], weight_decay=1e-4)
+        
+        # Cosine annealing scheduler
+        self.scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            self.meta_optimizer, T_max=100, eta_min=meta_lr/50
         )
         
-        # Track progress
-        self.loss_history = deque(maxlen=1000)
-        self.acc_history = deque(maxlen=1000)
+        # Tracking
+        self.loss_history = deque(maxlen=500)
+        self.acc_history = deque(maxlen=500)
         
+        print(f"🎯 MAML initialized with backbone LR: {meta_lr * 0.1:.1e}, classifier LR: {meta_lr:.1e}")
+    
+    def get_lr_scale(self, epoch):
+        """Warmup scaling"""
+        if epoch < self.warmup_epochs:
+            return 0.1 + 0.9 * (epoch / self.warmup_epochs)
+        return 1.0
+    
     def inner_loop(self, support_data, support_labels, criterion, device):
-        """Aggressive inner loop with many adaptation steps"""
+        """Inner loop with pretrained features"""
         fast_model = self.model.clone().to(device)
         fast_model.train()
         
         inner_losses = []
         inner_accuracies = []
         
-        # MANY inner steps for thorough adaptation
         for step in range(self.num_inner_steps):
             outputs = fast_model(support_data)
             loss = criterion(outputs, support_labels)
             inner_losses.append(loss.item())
             
-            # Track adaptation progress
+            # Track adaptation
             with torch.no_grad():
                 _, preds = torch.max(outputs, 1)
                 acc = (preds == support_labels).float().mean()
@@ -255,48 +319,48 @@ class UltraAggressiveMAML:
             # Compute gradients
             gradients = torch.autograd.grad(
                 loss, fast_model.parameters(),
-                create_graph=True,  # Second-order for best accuracy
-                retain_graph=False
+                create_graph=True, retain_graph=False
             )
             
-            # Apply large learning rate for fast adaptation
+            # Apply gradients with different rates for backbone vs classifier
             with torch.no_grad():
-                for param, grad in zip(fast_model.parameters(), gradients):
+                for (name, param), grad in zip(fast_model.named_parameters(), gradients):
                     if grad is not None:
-                        param.subtract_(self.inner_lr * grad)
+                        # Lower learning rate for pretrained backbone
+                        if 'classifier' in name:
+                            lr = self.inner_lr
+                        else:
+                            lr = self.inner_lr * 0.1  # Much smaller for pretrained parts
+                        
+                        param.subtract_(lr * grad)
         
-        print(f"    Inner adaptation: {inner_accuracies[0]:.3f} → {inner_accuracies[-1]:.3f}")
         return fast_model, inner_losses, inner_accuracies
     
-    def meta_step(self, batch_tasks, criterion, device):
-        """Simple, effective meta step"""
+    def meta_step(self, batch_tasks, criterion, device, epoch=0):
+        """Meta step with pretrained model"""
         self.model.train()
         meta_losses = []
         task_accuracies = []
-        adaptation_improvements = []
+        inner_improvements = []
         
-        print(f"  Processing {len(batch_tasks)} tasks...")
+        lr_scale = self.get_lr_scale(epoch)
+        
+        print(f"  Processing {len(batch_tasks)} tasks with pretrained ConvNeXt...")
         
         for task_idx, (support_data, support_labels, query_data, query_labels) in enumerate(batch_tasks):
             try:
-                # Move to device
                 support_data = support_data.to(device)
                 support_labels = support_labels.to(device)
                 query_data = query_data.to(device)
                 query_labels = query_labels.to(device)
-                
-                print(f"  Task {task_idx + 1}/{len(batch_tasks)}:")
-                print(f"    Support: {support_data.shape}, Query: {query_data.shape}")
-                print(f"    Classes: {support_labels.unique().tolist()}")
                 
                 # Inner loop adaptation
                 fast_model, inner_losses, inner_accs = self.inner_loop(
                     support_data, support_labels, criterion, device
                 )
                 
-                # Calculate adaptation improvement
                 adaptation_improvement = inner_accs[-1] - inner_accs[0]
-                adaptation_improvements.append(adaptation_improvement)
+                inner_improvements.append(adaptation_improvement)
                 
                 # Query evaluation
                 fast_model.eval()
@@ -311,71 +375,80 @@ class UltraAggressiveMAML:
                     _, preds = torch.max(query_outputs, 1)
                     accuracy = (preds == query_labels).float().mean()
                     task_accuracies.append(accuracy.item())
-                    
-                print(f"    Query accuracy: {accuracy:.3f}")
+                
+                if task_idx < 3:  # Show first few tasks
+                    print(f"    Task {task_idx+1}: {inner_accs[0]:.3f} → {inner_accs[-1]:.3f} → Query: {accuracy:.3f}")
                 
             except Exception as e:
-                print(f"    ERROR in task {task_idx}: {e}")
+                print(f"    Error in task {task_idx}: {e}")
                 continue
         
         if len(meta_losses) > 0:
             meta_loss = torch.stack(meta_losses).mean()
             
-            # Meta optimization
+            # Meta optimization with learning rate scaling
             self.meta_optimizer.zero_grad()
             meta_loss.backward()
             
-            # Generous gradient clipping
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), 5.0)
+            # Gradient clipping
+            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.gradient_clip)
+            
+            # Apply warmup scaling
+            for param_group in self.meta_optimizer.param_groups:
+                param_group['lr'] = param_group['lr'] * lr_scale
             
             self.meta_optimizer.step()
             
             # Track metrics
             avg_accuracy = np.mean(task_accuracies)
-            avg_adaptation = np.mean(adaptation_improvements)
+            avg_improvement = np.mean(inner_improvements)
             
             self.loss_history.append(meta_loss.item())
             self.acc_history.append(avg_accuracy)
             
-            return meta_loss.item(), avg_accuracy, avg_adaptation
+            return meta_loss.item(), avg_accuracy, avg_improvement
         
         return 0.0, 0.0, 0.0
     
-    def get_smoothed_metrics(self, window=5):
-        """Quick smoothing for stability"""
+    def get_smoothed_metrics(self, window=7):
+        """Get smoothed metrics"""
         if len(self.acc_history) >= window:
             smooth_acc = np.mean(list(self.acc_history)[-window:])
             smooth_loss = np.mean(list(self.loss_history)[-window:])
             return smooth_loss, smooth_acc
         return 0.0, 0.0
 
-def run_ultra_simple_meta_learning(config):
-    """Ultra-simple meta-learning for guaranteed 90%+ accuracy"""
+def run_pretrained_convnext_meta_learning(config):
+    """Meta-learning with pretrained ConvNeXt for 90%+ accuracy"""
     device = torch.device('cuda' if config['use_cuda'] and torch.cuda.is_available() else 'cpu')
-    print(f"🚀 ULTRA-SIMPLE Meta-Learning")
+    print(f"🚀 PRETRAINED ConvNeXt Meta-Learning")
     print(f"Device: {device}")
-    print(f"Target: 90%+ accuracy with simple CNN")
+    print(f"Target: 90%+ accuracy with pretrained features")
     
     # Load data
-    train_loader, num_classes, class_names = load_data_simple(
+    train_loader, num_classes, class_names = load_data_pretrained(
         data_dir=config['data_dir'],
         img_size=config['img_size'],
         batch_size=config['batch_size'],
         num_workers=config['num_workers']
     )
     
-    # Create ultra-simple model
-    model = UltraSimpleConvNet(num_classes=config['n_way']).to(device)
+    # Create pretrained ConvNeXt model
+    model = PretrainedConvNeXtMeta(
+        num_classes=config['n_way'],
+        variant=config['convnext_variant'],
+        freeze_backbone=config['freeze_backbone'],
+        dropout_rate=config['dropout_rate']
+    ).to(device)
     
-    total_params = sum(p.numel() for p in model.parameters())
-    print(f"Model parameters: {total_params:,} (ultra-simple)")
-    
-    # Initialize ultra-aggressive MAML
-    maml = UltraAggressiveMAML(
+    # Initialize MAML with pretrained model
+    maml = PretrainedMAML(
         model=model,
         inner_lr=config['inner_lr'],
         meta_lr=config['meta_lr'],
-        num_inner_steps=config['num_inner_steps']
+        num_inner_steps=config['num_inner_steps'],
+        gradient_clip=config['gradient_clip'],
+        warmup_epochs=config['warmup_epochs']
     )
     
     criterion = nn.CrossEntropyLoss()
@@ -387,16 +460,15 @@ def run_ultra_simple_meta_learning(config):
         'meta_loss': [],
         'task_acc': [],
         'smoothed_acc': [],
-        'adaptation_improvement': []
+        'inner_improvement': []
     }
     
     print(f"\n📚 Training Configuration:")
-    print(f"  {config['n_way']}-way classification")
-    print(f"  {config['k_shot']}-shot learning (LOTS of examples)")
+    print(f"  Model: ConvNeXt-{config['convnext_variant']} (pretrained)")
+    print(f"  {config['n_way']}-way, {config['k_shot']}-shot learning")
     print(f"  {config['num_inner_steps']} adaptation steps")
     print(f"  {config['tasks_per_epoch']} tasks per epoch")
-    print(f"  Inner LR: {config['inner_lr']} (aggressive)")
-    print(f"  Meta LR: {config['meta_lr']}")
+    print(f"  Backbone frozen: {config['freeze_backbone']}")
     
     # Training loop
     for epoch in range(config['meta_epochs']):
@@ -405,8 +477,8 @@ def run_ultra_simple_meta_learning(config):
         print(f"EPOCH {epoch+1}/{config['meta_epochs']}")
         print(f"{'='*60}")
         
-        # Create easy tasks
-        train_tasks = create_easy_tasks(
+        # Create tasks
+        train_tasks = create_pretrained_tasks(
             train_loader,
             num_tasks=config['tasks_per_epoch'],
             n_way=config['n_way'],
@@ -419,8 +491,8 @@ def run_ultra_simple_meta_learning(config):
             continue
         
         # Meta training step
-        meta_loss, task_acc, adaptation_improvement = maml.meta_step(
-            train_tasks, criterion, device
+        meta_loss, task_acc, inner_improvement = maml.meta_step(
+            train_tasks, criterion, device, epoch
         )
         
         # Get smoothed metrics
@@ -432,8 +504,14 @@ def run_ultra_simple_meta_learning(config):
         history['meta_loss'].append(meta_loss)
         history['task_acc'].append(task_acc)
         history['smoothed_acc'].append(smooth_acc)
-        history['adaptation_improvement'].append(adaptation_improvement)
+        history['inner_improvement'].append(inner_improvement)
         
+        # Step scheduler after warmup
+        if epoch >= config['warmup_epochs']:
+            maml.scheduler.step()
+        
+        current_backbone_lr = maml.meta_optimizer.param_groups[0]['lr']
+        current_classifier_lr = maml.meta_optimizer.param_groups[1]['lr']
         epoch_time = time.time() - epoch_start
         
         # Rich logging
@@ -441,21 +519,20 @@ def run_ultra_simple_meta_learning(config):
         print(f"  Meta Loss: {meta_loss:.4f}")
         print(f"  Task Accuracy: {task_acc:.4f} ({task_acc*100:.1f}%)")
         print(f"  Smoothed Accuracy: {smooth_acc:.4f} ({smooth_acc*100:.1f}%)")
-        print(f"  Adaptation Gain: +{adaptation_improvement:.3f}")
+        print(f"  Inner Improvement: +{inner_improvement:.3f}")
+        print(f"  LR - Backbone: {current_backbone_lr:.1e}, Classifier: {current_classifier_lr:.1e}")
         
         # Progress indicators
         if smooth_acc >= 0.95:
-            print(f"  🎉 EXCELLENT: {smooth_acc*100:.1f}% (≥95%)")
+            print(f"  🎉 OUTSTANDING: {smooth_acc*100:.1f}% (≥95%)")
         elif smooth_acc >= 0.90:
-            print(f"  🎯 TARGET HIT: {smooth_acc*100:.1f}% (≥90%)")
+            print(f"  🎯 TARGET ACHIEVED: {smooth_acc*100:.1f}% (≥90%)")
         elif smooth_acc >= 0.80:
-            print(f"  ✅ VERY GOOD: {smooth_acc*100:.1f}% (≥80%)")
+            print(f"  ✅ EXCELLENT: {smooth_acc*100:.1f}% (≥80%)")
         elif smooth_acc >= 0.70:
-            print(f"  📈 GOOD PROGRESS: {smooth_acc*100:.1f}% (≥70%)")
-        elif smooth_acc >= 0.60:
-            print(f"  🔄 LEARNING: {smooth_acc*100:.1f}% (≥60%)")
+            print(f"  📈 VERY GOOD: {smooth_acc*100:.1f}% (≥70%)")
         else:
-            print(f"  ⚠️  SLOW START: {smooth_acc*100:.1f}% (<60%)")
+            print(f"  🔄 LEARNING: {smooth_acc*100:.1f}% (<70%)")
         
         # Save best model
         if smooth_acc > best_accuracy:
@@ -468,7 +545,7 @@ def run_ultra_simple_meta_learning(config):
                 'accuracy': smooth_acc,
                 'config': config,
                 'history': history
-            }, os.path.join(config['model_dir'], 'ultra_simple_best_model.pth'))
+            }, os.path.join(config['model_dir'], 'best_pretrained_convnext_meta.pth'))
             
             print(f"  💾 NEW BEST: {smooth_acc*100:.1f}% (saved)")
         else:
@@ -477,16 +554,15 @@ def run_ultra_simple_meta_learning(config):
         
         # Early stopping
         if patience_counter >= config['early_stopping_patience']:
-            print(f"\n🛑 EARLY STOPPING after {patience_counter} epochs without improvement")
+            print(f"\n🛑 Early stopping after {patience_counter} epochs")
             break
         
-        # SUCCESS CHECK
+        # Success check
         if smooth_acc >= 0.90:
-            print(f"\n🎯 SUCCESS! Target accuracy achieved: {smooth_acc*100:.1f}%")
-            print("You can stop training now or continue for even higher accuracy.")
+            print(f"\n🎯 SUCCESS! Target 90%+ accuracy achieved: {smooth_acc*100:.1f}%")
         
-        # Plot progress every 10 epochs
-        if (epoch + 1) % 10 == 0:
+        # Plot progress every 15 epochs
+        if (epoch + 1) % 15 == 0:
             plt.figure(figsize=(15, 5))
             
             plt.subplot(1, 3, 1)
@@ -494,7 +570,7 @@ def run_ultra_simple_meta_learning(config):
             plt.plot(history['smoothed_acc'], linewidth=2, label='Smoothed Accuracy')
             plt.axhline(y=0.9, color='g', linestyle='--', label='90% Target')
             plt.axhline(y=0.95, color='r', linestyle='--', label='95% Target')
-            plt.title('Meta-Learning Accuracy')
+            plt.title(f'ConvNeXt-{config["convnext_variant"]} Meta-Learning')
             plt.ylabel('Accuracy')
             plt.xlabel('Epoch')
             plt.legend()
@@ -508,30 +584,31 @@ def run_ultra_simple_meta_learning(config):
             plt.grid(True)
             
             plt.subplot(1, 3, 3)
-            plt.plot(history['adaptation_improvement'])
-            plt.title('Adaptation Improvement')
+            plt.plot(history['inner_improvement'])
+            plt.title('Inner Loop Improvement')
             plt.ylabel('Accuracy Gain')
             plt.xlabel('Epoch')
             plt.grid(True)
             
             plt.tight_layout()
-            plt.savefig(os.path.join(config['model_dir'], f'ultra_simple_progress_epoch_{epoch+1}.png'))
+            plt.savefig(os.path.join(config['model_dir'], f'pretrained_convnext_progress_epoch_{epoch+1}.png'))
             plt.show()
     
-    print(f"\n🏁 ULTRA-SIMPLE META-LEARNING COMPLETED!")
+    print(f"\n🏁 PRETRAINED ConvNeXt Meta-Learning COMPLETED!")
     print(f"🎯 Best accuracy achieved: {best_accuracy*100:.1f}%")
     
     if best_accuracy >= 0.95:
-        print("🎉 OUTSTANDING: 95%+ accuracy!")
+        print("🎉 OUTSTANDING: 95%+ accuracy with pretrained ConvNeXt!")
     elif best_accuracy >= 0.90:
-        print("🎯 SUCCESS: 90%+ target achieved!")
+        print("🎯 SUCCESS: 90%+ target achieved with pretrained features!")
     elif best_accuracy >= 0.80:
-        print("✅ VERY GOOD: 80%+ accuracy")
+        print("✅ VERY GOOD: 80%+ accuracy - pretrained features working well")
     else:
-        print("🔄 Consider even simpler tasks or longer training")
+        print("🔄 Consider: Different ConvNeXt variant or longer training")
     
     return model, history
 
-# Run the ultra-simple approach
-print("🚀 Starting ULTRA-SIMPLE approach for guaranteed 90%+ accuracy")
-model, history = run_ultra_simple_meta_learning(ultra_config)
+# Run pretrained ConvNeXt meta-learning
+print("🚀 Starting PRETRAINED ConvNeXt Meta-Learning")
+print("Using ImageNet pretrained features for superior accuracy")
+model, history = run_pretrained_convnext_meta_learning(pretrained_config)
